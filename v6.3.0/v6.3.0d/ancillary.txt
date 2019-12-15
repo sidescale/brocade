@@ -1,0 +1,14 @@
+
+This ancillary.txt file provides information as to how to obtain the open source or other third 
+party licenses in this distribution. To obtain such licenses, run the following CLI command 
+at the prompt, "opensource". 
+
+This ancillary.txt file also provides the instructions for customers who require a copy of the
+machine-readable GPL Source Code by written request.  Upon your written request, HP will 
+provide to You, for a fee covering the cost of distribution, a complete machine-readable copy 
+of the GPL Source Code. Your written request for GPL Source Code can be sent via 
+email to FC_Infrastructure_OpenSourceRequest@hp.com. In the request, include product name, 
+version number, your name, and your shipping address. 
+
+
+ 

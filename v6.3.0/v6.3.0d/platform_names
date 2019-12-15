@@ -1,0 +1,65 @@
+#    Copyright (c) 1996-2009 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#      List of supported platforms.
+#
+
+
+#
+# List of acceptable names for each platform ID.
+# Each platform ID has a single line with all associated names on the same line
+#
+SWBD10: swbd10 sw12000 ulysses
+SWBD12: swbd12 sw3900 terminator
+SWBD21: swbd21 sw24000 meteor
+SWBD22: swbd22 sw3016 blazer
+SWBD23: swbd23 pulsar
+SWBD24: swbd24 swbd25 olympus apollo
+SWBD26: swbd26 sw3850 dazzler
+SWBD27: swbd27 sw3250 dazzlerjr
+SWBD28: swbd28 hampton
+SWBD29: swbd29 sw4012 icecube
+SWBD30: swbd30 sw3950 terminator-cr
+SWBD31: swbd31 sw3916 cygnus
+SWBD32: swbd32 pulsar32
+SWBD33: swbd33 sw3014 glacier
+SWBD34: swbd34 stealth
+SWBD36: swbd36 marathon
+SWBD37: swbd37 sw4020 blazer2
+SWBD42: swbd42 saturn
+SWBD43: swbd43 sw4024 icecube2 bradley 
+SWBD44: swbd44 sw4900 viking
+SWBD45: swbd45 sw4016 glacier2 nighthawk
+SWBD46: swbd46 sprint
+SWBD47: swbd47 ironman
+SWBD50: swbd50 scimitar
+SWBD51: swbd51 sw4018 dragon
+SWBD52: swbd52 scimitar-sas
+SWBD55: swbd55 scimitar-freescale
+SWBD57: swbd57 scimitar-dmm
+SWBD58: swbd58 Brocade5000 pulsar2
+SWBD61: swbd61 Brocade4424 superhawk
+SWBD62: swbd62 zentron
+SWBD63: swbd63 zentron-cocpu
+SWBD64: swbd64 thor
+SWBD66: swbd66 spirit
+SWBD67: swbd67 mace
+SWBD68: swbd68 lance 
+SWBD70: swbd70 sw5410 little bear 8g
+SWBD71: swbd71 tomahawk
+SWBD72: swbd72 bulova
+SWBD73: swbd73 blazer3 dirk
+SWBD75: swbd75 superhawk2
+SWBD76: swbd76 elara
+SWBD77: swbd77 zentron-Pluto
+SWBD79: swbd79 spear CP
+SWBD80: swbd80 spearlite CP
+SWBD81: swbd81 spear/spearlite BP
+SWBD82: swbd82 utah
+SWBD83: swbd83 spike CP
+SWBD85: swbd85 spike BP
+SWBD86: swbd86 falcon2
+SWBD87: swbd87 kestrel2
+SWBD88: swbd88 europa
+SWBD89: swbd89 striker

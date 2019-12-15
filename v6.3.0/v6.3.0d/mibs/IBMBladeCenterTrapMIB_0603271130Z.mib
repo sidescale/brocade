@@ -1,0 +1,288 @@
+SW-MIB DEFINITIONS ::= BEGIN
+  IMPORTS
+	DisplayString
+      FROM SNMPv2-TC
+    Counter32, Integer32, IpAddress,
+    OBJECT-TYPE, OBJECT-IDENTITY,
+	MODULE-IDENTITY, NOTIFICATION-TYPE
+      FROM SNMPv2-SMI
+    FcWwn, SwDomainIndex, SwNbIndex, SwSensorIndex,
+    SwPortIndex, SwTrunkMaster
+      FROM Brocade-TC
+    fcSwitch, bcsiModules
+      FROM Brocade-REG-MIB;
+
+  swIBMMibModule MODULE-IDENTITY
+    LAST-UPDATED "200603270000Z"
+    ORGANIZATION "Brocade Communications Systems, Inc."
+    CONTACT-INFO "Customer Support Group
+ 		  Brocade Communications Systems,
+ 		  1745 Technology Drive,
+ 		  San Jose, CA 95110 U.S.A
+ 		  Tel: +1-408-392-6061
+ 		  Fax: +1-408-392-6656
+ 		  Email: support@Brocade.COM
+ 		  WEB: www.brocade.com"
+		
+
+    DESCRIPTION	"The MIB module	is for Brocade's Fibre Channel Switch.
+                 Copyright (c) 1996-2006 Brocade Communications Systems, Inc.
+  				 All rights reserved."
+    REVISION	"0603271130Z" -- Mar 27, 2006 11:30am
+    DESCRIPTION	"The initial version of this module."
+    ::=	{ bcsiModules 3 }
+
+    swSilkWorm3016		    OBJECT-IDENTITY
+     STATUS  current
+     DESCRIPTION   "The OID sub-tree for Brocade's SilkWorm 3016 switch."
+     ::= { fcSwitch 22 }
+
+	
+--
+-- Enterprise Specific Traps for Fibre Channel Switch (Brocade SilkWorm 3016).
+--
+
+  swTrapsV2Silkworm3016 OBJECT-IDENTITY
+    STATUS     current
+	DESCRIPTION	"The Traps for Brocade's SilkWorm 3016 switch."
+	::= { swSilkWorm3016 0 }
+
+  swFaultSilkworm3016		NOTIFICATION-TYPE
+	OBJECTS	{ swDiagResult, swSsn , swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swFault(1) is generated whenever the diagnostics
+		detects a fault with the switch."
+	--#TYPE		"Switch is faulty."
+	--#SUMMARY	"Faulty reason: %d and SSN is #%s,GroupName %s,GroupType %s,GroupMemPosition %d""
+	--#ARGUMENTS	{ 0, 1, 2, 3, 4}
+	--#SEVERITY	CRITICAL
+	--#TIMEINDEX	1
+	--#STATE	NONOPERATIONAL
+	::= { swTrapsV2Silkworm3016 1 }
+
+  swSensorScnSilkworm3016	NOTIFICATION-TYPE
+	OBJECTS	{ swSensorStatus, swSensorIndex, swSensorType,
+					swSensorValue, swSensorInfo, swSsn,
+					swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swSensorScn(2) is generated whenever an
+		environment sensor changes its operational state. For instance,
+		a fan stop working. The VarBind in the Trap Data Unit shall
+		contain the corresponding instance of the sensor
+		status, sensor index, sensor type, sensor value (reading)
+		and sensor information. Note that the sensor information
+		contains the type of sensor and its number in textual format."
+	--#TYPE		"A sensor (temperature, fan, etc.) changed its operational state."
+	--#SUMMARY	"%s: is currently in state %d and SSN is #%s GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 4, 0, 5, 6, 7, 8 }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2Silkworm3016 2 }
+
+   swFCPortScnSilkworm3016		NOTIFICATION-TYPE
+	OBJECTS	{ swFCPortOpStatus, swFCPortIndex, swFCPortName,
+					swSsn, swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swFCPortScn(3) is generated whenever an FC_Port
+		changes its operational state. For instance, the FC_Port
+		goes from on-line to offline. The VarBind in the Trap Data
+		Unit shall contain the corresponding instance of the
+		FC_Port's operational status, index, swFCPortName and
+		swSsn. swFCPortName, swSsn are optional."
+	--#TYPE		"A Fibre Channel Port changed its operational state."
+	--#SUMMARY	"Port Index %d changed state to %d  Port Name: %s and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 1, 0, 2, 3, 4, 5, 6 }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2Silkworm3016 3 }
+
+   swEventTrapSilkworm3016           NOTIFICATION-TYPE
+        OBJECTS       { swEventIndex, swEventTimeInfo, swEventLevel,
+                          swEventRepeatCount, swEventDescr, swSsn,
+						  swGroupName,swGroupType,swGroupMemPos }
+        STATUS      current
+        DESCRIPTION     "This trap is generated when an event whose
+                level at or below swEventTrapLevel occurs."
+	--#TYPE		"A firmware event has been logged"
+	--#SUMMARY	"Event %d: %s (severity level %d) - %s SSN is #%s GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 0, 1, 2, 4, 5, 6, 7, 8}
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2Silkworm3016 4 }
+
+  -- traps for Fabric Watch subsystem
+
+  swFabricWatchTrapSilkworm3016	NOTIFICATION-TYPE
+	OBJECTS	{	swFwClassAreaIndex,
+					swFwThresholdIndex,
+					swFwName,
+					swFwLabel,
+					swFwLastEventVal,
+					swFwLastEventTime,
+					swFwLastEvent,
+					swFwLastState,
+					swSsn,
+				    swGroupName,
+					swGroupType,
+					swGroupMemPos
+					}
+	STATUS	current
+	DESCRIPTION	"trap to be sent by Fabric Watch to notify of an event"
+	--#TYPE		"Fabric Watch has generated an event"
+	--#SUMMARY	"Threshold %s in Class/Area %d at index %d has generated event %d with %d on %s. This event is %d and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 2, 0, 1, 6, 4, 5 , 7 , 8, 9, 10, 11}
+	--#SEVERITY	WARNING
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2Silkworm3016 5 }
+
+  -- traps for track changes subsystem
+
+  swTrackChangesTrapSilkworm3016	NOTIFICATION-TYPE
+	OBJECTS	{	swTrackChangesInfo, swSsn,
+					swGroupName, swGroupType, swGroupMemPos
+					}
+	STATUS	current
+	DESCRIPTION	"trap to be sent for tracking login/logout/config changes"
+	--#TYPE		"Track changes has generated a trap"
+	--#SUMMARY	"%s and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 0, 1, 2, 3, 4  }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2Silkworm3016 6 }
+
+    swSilkWorm4020		    OBJECT-IDENTITY
+     STATUS  current
+     DESCRIPTION   "The OID sub-tree for Brocade's Silkworm Series of
+                    Fibre Channel Switches."
+     ::= { fcSwitch 16 }
+
+
+--
+-- Enterprise Specific Traps for Fibre Channel Switch (Brocade's SilkWorm 4020).
+--
+
+	swSilkWorm4020		    OBJECT-IDENTITY
+     STATUS  current
+     DESCRIPTION   "The OID sub-tree for Brocade's SilkWorm 4020."
+     ::= { fcSwitch 37 }
+
+  swTrapsV2SilkWorm4020 OBJECT-IDENTITY
+    STATUS     current
+	DESCRIPTION	"The Traps for Brocade's SilkWorm 4020."
+	::= { swSilkWorm4020 0 }
+
+  swFaultSilkWorm4020		NOTIFICATION-TYPE
+	OBJECTS	{ swDiagResult, swSsn , swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swFault(1) is generated whenever the diagnostics
+		detects a fault with the switch."
+	--#TYPE		"Switch is faulty."
+	--#SUMMARY	"Faulty reason: %d and SSN is #%s,GroupName %s,GroupType %s,GroupMemPosition %d""
+	--#ARGUMENTS	{ 0, 1, 2, 3, 4}
+	--#SEVERITY	CRITICAL
+	--#TIMEINDEX	1
+	--#STATE	NONOPERATIONAL
+	::= { swTrapsV2SilkWorm4020 1 }
+
+  swSensorScnSilkWorm4020	NOTIFICATION-TYPE
+	OBJECTS	{ swSensorStatus, swSensorIndex, swSensorType,
+					swSensorValue, swSensorInfo, swSsn,
+					swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swSensorScn(2) is generated whenever an
+		environment sensor changes its operational state. For instance,
+		a fan stop working. The VarBind in the Trap Data Unit shall
+		contain the corresponding instance of the sensor
+		status, sensor index, sensor type, sensor value (reading)
+		and sensor information. Note that the sensor information
+		contains the type of sensor and its number in textual format."
+	--#TYPE		"A sensor (temperature, fan, etc.) changed its operational state."
+	--#SUMMARY	"%s: is currently in state %d and SSN is #%s GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 4, 0, 5, 6, 7, 8 }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2SilkWorm4020 2 }
+
+   swFCPortScnSilkWorm4020		NOTIFICATION-TYPE
+	OBJECTS	{ swFCPortOpStatus, swFCPortIndex, swFCPortName,
+					swSsn, swGroupName, swGroupType, swGroupMemPos }
+	STATUS	current
+	DESCRIPTION	"A swFCPortScn(3) is generated whenever an FC_Port
+		changes its operational state. For instance, the FC_Port
+		goes from on-line to offline. The VarBind in the Trap Data
+		Unit shall contain the corresponding instance of the
+		FC_Port's operational status, index, swFCPortName and
+		swSsn. swFCPortName, swSsn are optional."
+	--#TYPE		"A Fibre Channel Port changed its operational state."
+	--#SUMMARY	"Port Index %d changed state to %d  Port Name: %s and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 1, 0, 2, 3, 4, 5, 6 }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2SilkWorm4020 3 }
+
+   swEventTrapSilkWorm4020           NOTIFICATION-TYPE
+        OBJECTS       { swEventIndex, swEventTimeInfo, swEventLevel,
+                          swEventRepeatCount, swEventDescr, swSsn,
+						  swGroupName,swGroupType,swGroupMemPos }
+        STATUS      current
+        DESCRIPTION     "This trap is generated when an event whose
+                level at or below swEventTrapLevel occurs."
+	--#TYPE		"A firmware event has been logged"
+	--#SUMMARY	"Event %d: %s (severity level %d) - %s SSN is #%s GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 0, 1, 2, 4, 5, 6, 7, 8}
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2SilkWorm4020 4 }
+
+  -- traps for Fabric Watch subsystem
+
+  swFabricWatchSilkWorm4020	NOTIFICATION-TYPE
+	OBJECTS	{	swFwClassAreaIndex,
+					swFwThresholdIndex,
+					swFwName,
+					swFwLabel,
+					swFwLastEventVal,
+					swFwLastEventTime,
+					swFwLastEvent,
+					swFwLastState,
+					swSsn,
+				    swGroupName,
+					swGroupType,
+					swGroupMemPos
+					}
+	STATUS	current
+	DESCRIPTION	"trap to be sent by Fabric Watch to notify of an event"
+	--#TYPE		"Fabric Watch has generated an event"
+	--#SUMMARY	"Threshold %s in Class/Area %d at index %d has generated event %d with %d on %s. This event is %d and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 2, 0, 1, 6, 4, 5 , 7 , 8, 9, 10, 11}
+	--#SEVERITY	WARNING
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2SilkWorm4020 5 }
+
+  -- traps for track changes subsystem
+
+  swTrackChangesSilkWorm4020	NOTIFICATION-TYPE
+	OBJECTS	{	swTrackChangesInfo, swSsn,
+					swGroupName, swGroupType, swGroupMemPos
+					}
+	STATUS	current
+	DESCRIPTION	"trap to be sent for tracking login/logout/config changes"
+	--#TYPE		"Track changes has generated a trap"
+	--#SUMMARY	"%s and SSN is #%s, GroupName %s,GroupType %s,GroupMemPosition %d"
+	--#ARGUMENTS	{ 0, 1, 2, 3, 4  }
+	--#SEVERITY	INFORMATIONAL
+	--#TIMEINDEX	1
+	--#STATE	OPERATIONAL
+	::= { swTrapsV2SilkWorm4020 6 }
+
+ 
+END

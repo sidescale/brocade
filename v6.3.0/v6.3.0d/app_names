@@ -1,0 +1,10 @@
+
+
+#    Copyright (c) 2007 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#      List of applications and their platform IDs.
+#
+swbd52: sas
+swbd57: dmm

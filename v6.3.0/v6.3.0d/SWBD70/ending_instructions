@@ -1,0 +1,43 @@
+Post installation instructions:
+
+A system WITHOUT A CHASSIS for a FIRST TIME LOAD the next steps are:
+   1. You may now reboot the system. Be sure you have a console
+      connection to the system before rebooting.
+   2. Run 'host_setup <ipaddress> CP<serialnumber(6 digit)>' once the
+      system is back up to allow the network interface(s) to work.
+   3. Since there are no fans connected to the board, the thermal and
+      voltage monitoring policies in the software need to be bypassed.
+
+      Run 'touch /var/emd.factory' (bypasses thermal and voltage)
+      Run 'touch /mnt/var/emd.factory' (bypasses thermal and voltage)
+
+   4. Initialize the non-volitile system hardware descriptions for
+      software.
+      Run '/fabos/xtool/seepromInit.xtl -T' to configure the FRU data.
+   5. Run 'chkconfig fabos on' to enable Fabric OS.
+   6. Run 'sync' to save the config changes in flask.
+   7. Reboot the system once more for changes to take effect.
+   8. Run 'ipaddrset' to set the ip address when fabos is on
+
+A system WITH A CHASSIS for a FIRST TIME LOAD the next steps are:
+   1. You may now reboot the system. Be sure you have a console
+      connection to the system before rebooting.
+   2. Run 'host_setup <ipaddress> CP<serialnumber(6 digit)>' once the
+      system is back up to allow the network interface(s) to work.
+   3. Initialize the non-volitile system hardware descriptions for
+      software if not already done.
+      Run '/fabos/xtool/seepromInit.xtl -T' to configure the FRU data.
+   4. Run 'chkconfig fabos on' to enable Fabric OS.
+   5. Reboot the system once more for changes to take effect.
+   6. Run 'sync' to save the config changes in flask.
+   7. Run 'ipaddrset' to set the ip address when fabos is on
+
+A system WITH A CHASSIS for a SOFTWARE UPDATE the next steps are:
+   1. You may now reboot the system. Be sure you have a console
+      connection to the system before rebooting.
+   2. Run 'host_setup <ipaddress> CP<serialnumber(6 digit)>' once the
+      system is back up to allow the network interface(s) to work.
+   3. Run 'chkconfig fabos on' to enable Fabric OS.
+   4. Reboot the system once more for changes to take effect.
+
+

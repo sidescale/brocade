@@ -1,0 +1,979 @@
+#!/bin/sh
+#    Copyright (c) 1996-2008 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#
+#    Description:
+#      Install script that initializes a platform
+#
+#      6/15/2006  updated for Linux 2.6 installation  
+#
+#      7/11/2006  updated for development and nfdiag plist installs
+#
+#      8/02/2006  updated to fix create_release_file
+#
+#      8/24/2006  updated to fix xfs doesnt work on terminator, use ext3
+#                 fix access to create_release_file
+#                 picked up a BD=55 tweak for bootenv
+#
+#      8/28/2006  updated to make xfs to be used for BD=12 & 21 only
+#      8/31/2006  reordered the disk setup to do partition then mkfs 
+#                 do both before entering install loop
+#      9/27/2006  added swbd22 to xfs to be used
+
+
+# Set the LD_LIBRARY_PATH for the interdependency 
+export PATH=$PATH:/bin:/sbin:/mnt/bin:/mnt/sbin
+export LD_LIBRARY_PATH="/lib:/usr/lib:/mnt/lib"
+
+# This function is here because of sporadic new hardware failures with
+# parted.  Parted erroneously find the label "in use" and fail writing
+# the label.  Since we know that the CF cannot be in use by anything else
+# when install is running, we clobber the label block with zeros to assure
+# that parted will work.
+clobber_label()
+{
+    if [ -e /tmp/foo ] ; then           # prevent unexpected messages
+        rm /tmp/foo 
+    fi
+    i=0
+    while (( $i < 256 )) ; do
+#                1 2 3 4 5 6 7 8 9 a b c d e f  (16*256 = 4096)
+        printf "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" >> /tmp/foo
+        i=$(( $i + 1 ))
+    done
+    cat /tmp/foo > /dev/hda
+    rc=$?
+    if [ -e /tmp/foo ] ; then           # prevent unexpected messages
+        rm /tmp/foo 
+    fi
+    if (( ${rc} )) ; then
+        echo INSTALL26: Cannot write to /dev/hda.   Install ABORTED
+        exit 0
+    fi
+}
+
+usage() {
+    program=`basename $0`
+
+    echo "Usage: $program <platform> <TEST | EXTENDED> package"
+    echo "  platform      <Optional> hardware must be this platform."
+    echo "  TEST          Perform read/write testing of compact flash memory."
+    echo "  EXTENDED      Perform extended testing of compact flash memory."
+    echo "  package       Package to install."
+
+    echo ""
+    echo "Platforms for this product are:"
+    cat platform_names | grep $PLATFORM | cut -d":" -f2- | xargs
+    echo ""
+    echo "Platform \"$PLATFORM\" packages are:"
+    if [ "`ls ./$PLATFORM/*.plist 2>/dev/null`" = "" ]
+    then
+      echo "INTERNAL ERROR: No packages found for platform $PLATFORM"
+    else
+      ls ./$PLATFORM/*.plist 2>/dev/null | cut -d"/" -f3 | cut -d "." -f1
+    fi
+    echo ""
+    exit 1
+}
+
+exit_out()
+{
+    if [ $error = TRUE ]
+    then
+	echo "INSTALL26: install FAILED with $warn_count warnings."
+	exit 1
+    else
+	if [ $warn_count ]
+	then
+	    echo "INSTALL26: install PASSED with $warn_count warnings."
+	else
+	    echo "INSTALL26: install PASSED."
+	fi
+	exit 0
+    fi
+}
+
+#
+# do_command <warn/error> <command...>
+#
+do_command()
+{
+    warn=$1
+    shift
+    $*
+    if [ $? -ne 0 ]
+    then
+	if [ $warn = TRUE ]
+	then
+	    echo "INSTALL26: Warning - failed $*"
+	    warn_count=`expr $warn_count + 1`
+	    return 1
+	else
+	    echo "INSTALL26: ERROR - failed $*"
+	    continue=FALSE
+	    error=TRUE
+	    exit_out
+	fi
+    fi
+    return 0
+}
+#
+# install-rpms <plist> <root>
+#
+installrpms()
+{
+    LIST=$PLATFORM/$1
+
+    if [ ! -f $LIST ] || [ ! -r $LIST ]; then
+	echo "INSTALL26: Cannot open/read package list to install."
+	exit 1
+    fi
+
+    if [ ! -z $2 ]; then
+	ROOT=$2
+    else
+        ROOT=/
+    fi
+
+    RPM="rpm --root $ROOT"
+
+    echo "INSTALL26: Installing RPMs from $LIST rooted at $ROOT..."
+    echo "INSTALL26: Installing RPMs using $RPM ..."
+
+    if [ ! -d ${ROOT}/var/lib/rpm ]; then
+        echo "INSTALL26: Initializing RPM database..."
+	do_command TRUE mkdir -p ${ROOT}/var/lib/rpm
+	do_command TRUE rpm --root $ROOT --initdb
+    fi
+
+    #
+    # When we install the first package, we will not run any pre- or
+    # post-install of that package. The script will fail because the
+    # filesystem has just been initialized.
+    #
+    first_package=1
+
+    # echo "INSTALL26: install from list $LIST"
+    for package in `grep "\.rpm" $LIST `;
+    do
+        #echo "INSTALL26: installing  $package"
+	#
+	# Only install the package if it hasn't already been installed
+	# 
+	if [ $first_package -eq 1 ]; then
+	   do_command TRUE $RPM --force --nodeps -ivUh --noscripts $package
+	   first_package=0
+	else
+	   do_command TRUE $RPM --force --nodeps -ivUh $package
+	fi
+
+        # stop on problem to diagnose
+	if [ $? -ne 0 ]
+	then
+           echo "INSTALL26: install died  for $package"
+           echo "INSTALL26: cmd= $RPM --force --nodeps -ivUh $package"
+           exit 1
+	fi
+    done
+}
+
+copy_image_lists()
+{
+    LIST=$PLATFORM/$1
+    VCONF=$PLATFORM/$2
+
+    if [ ! -z $3 ]; then
+	ROOT=$3
+    else
+        ROOT=/
+    fi
+
+    do_command TRUE mkdir -p  ${ROOT}/var/images/$PLATFORM
+
+    if [ ! -f $LIST ] || [ ! -r $LIST ]; then
+	echo "INSTALL26: Cannot open/read package list to install. Skipping..."
+    else
+	do_command TRUE cp $LIST  ${ROOT}/var/images/$PLATFORM/plist
+    fi
+
+    if [ ! -f $VCONF ] || [ ! -r $VCONF ]; then
+	echo "INSTALL26: Cannot open/read version configuration. Skipping..."
+    else
+	do_command TRUE cp $VCONF ${ROOT}/var/images/$PLATFORM/version.conf
+    fi
+}
+
+#
+# Removes the linuxthreads based glibc files.
+# These are required only during RPM installation
+#
+reset_glibc()
+{
+    if [ ! -z $1 ]; then
+	ROOT=$1
+    else
+        ROOT=/
+    fi
+
+    >$ROOT/etc/ld.so.preload
+    cp $ROOT/var/glibc-linuxthreads/copyback/ld-2.3.6.so $ROOT/lib/ld-2.3.6.so
+    >$ROOT/var/glibc-linuxthreads/copyback/ld-2.3.6.so
+    cp $ROOT/var/glibc-linuxthreads/copyback/ldconfig $ROOT/sbin/ldconfig
+    >$ROOT/var/glibc-linuxthreads/copyback/ldconfig
+
+    # Store the checksums for ldconfig and ld.so
+    chroot $ROOT /usr/bin/md5sum /lib/ld-2.3.6.so >> $ROOT/etc/ldchksum
+    chroot $ROOT /usr/bin/md5sum /sbin/ldconfig >> $ROOT/etc/ldchksum
+
+    # Remove the linuxthreads package
+    ltpackage=`$RPM -qa | grep "glibc-linuxthreads"`
+    do_command TRUE $RPM -e $ltpackage
+
+    # Use grep from the distribution. grep utility bundled in
+    # busybox is messing up reading a binary file
+    do_command TRUE ${ROOT}/bin/grep -a -v "$ltpackage" ${ROOT}/var/images/$PLATFORM/plist > /tmp/.tmpplist
+    do_command TRUE mv /tmp/.tmpplist ${ROOT}/var/images/$PLATFORM/plist
+}
+
+#
+# test_for_product <candidate>
+#
+test_for_product()
+{
+    # Normalize the argument
+    candidate=`echo $1 | tr "A-Z" "a-z"`
+
+    #
+    # Look up the name in the list of known names for the platform ID
+    #
+    target=`grep $PLATFORM platform_names`
+    if [ "$target" = "" ]
+    then
+	echo "INSTALL26: Unknown Platform found $PLATFORM"
+	usage
+    fi
+    if [ "`echo $target | grep $candidate`" = "" ]
+    then
+	# It is not the one we are, is it a different product?
+	if [ "`grep $candidate platform_names`" != "" ]
+	then
+	    # output error message if valid product, otherwise it is not a 
+	    # product argument, and we use PLATFORM
+	    echo "INSTALL26: Actual platform ($PLATFORM) does not match specified platform $1."
+	    echo "INSTALL26: ERROR - failed $0 $*"
+	    continue=FALSE
+	    error=TRUE
+	    exit_out
+	fi
+	echo FALSE
+    else
+	echo $PLATFORM
+    fi
+}
+
+#
+# test_for_test <candidate>
+#
+test_for_test()
+{
+    if [ "$1" = "TEST" ]
+    then
+	echo 1
+    else
+	if [ "$1" = "EXTENDED" ]
+	then
+	    echo 2
+	else
+	    echo FALSE
+	fi
+    fi
+}
+
+#
+# test_for_package <candidate>
+#
+test_for_package()
+{
+    #abc=`echo $1 | tr -s '[:upper:]' '[:lower:]'`
+    abc=$(echo $1 | tr '[A-Z]' '[a-z]')
+
+    #
+    # See if first parameter was a PACKAGE
+    #
+    if [ -f ./$PLATFORM/$abc.plist ]
+    then
+	echo $abc
+    else
+	echo FALSE
+    fi
+}
+
+#
+# parse the command line arguments
+#
+parse_arguments()
+{
+    # check explicitly for package and test parameters, and assume 
+    # anything else is the plaftorm validation
+    #
+    while [ $# -gt 0 ]
+    do
+	result=`test_for_product $1`
+	if [ "$result" = "FALSE" ]
+	then
+	    result=`test_for_test $1`
+	    if [ "$result" = "FALSE" ]
+	    then
+		result=`test_for_package $1`
+		if [ "$result" = "FALSE" ]
+		then
+		    printf "INSTALL26: Unknown parameter %s\n" $1
+		    usage
+		else
+		    PACKAGE=$result
+		fi
+	    else
+		do_test=$result
+	    fi
+	else
+	    PLATFORM=$result
+	fi
+	shift
+    done
+
+    #######################
+    # Check the parameters
+    #
+    if [ ! -f ./$PLATFORM/$PACKAGE.plist ]
+    then
+	printf "INSTALL26: Incorrect package %s\n" $PACKAGE
+	usage
+    fi
+    case $PLATFORM in
+	"SWBD12" ) REVISION=3;;
+	        *) REVISION=2;;
+    esac
+}
+
+#------------------------------
+# BEGIN MAIN PART OF THE INSTALL26
+# BEGIN MAIN PART OF THE INSTALL26
+#------------------------------
+
+if [ -z `pwd | grep load` ]
+then
+    echo "INSTALL26: ERROR install directory is not mounted on /load."
+    exit 1
+fi
+
+for mnt in `mount | cut -d" " -f3 | grep "/mnt"`
+do
+    umount $mnt
+done
+
+FS='ext3'
+FSOPTS='-f'
+DEVICE='hda'
+TMPMNT='/mnt'
+do_test=NOTEST
+warn_count=0
+continue=TRUE
+OSLDR0=0
+OSLDR1=0
+ATABOOT=0
+error=FALSE
+
+echo "INSTALL26: Installing Linux 2.6 ..."
+
+PACKAGE="no_package_defined"
+node="platform"
+major=`grep $node\$ /proc/devices | cut -d ' ' -f 1`
+if [  $major ]; then
+    rm -f /dev/$node
+    mknod  /dev/$node c $major 0
+fi
+
+PLATFORM=`sin | \
+          /bin/grep Platform | \
+          /usr/bin/cut -d" " -f2 | \
+          /usr/bin/cut -d"," -f1`
+
+REVISION=`sin | \
+          /bin/grep Platform | \
+          /usr/bin/cut -d" " -f4`
+
+######################
+# parse the arguments
+parse_arguments $*
+
+case "$PLATFORM" in
+        "SWBD12" ) FS=xfs ;;
+        "SWBD21" ) FS=xfs ;;
+        "SWBD22" ) FS=xfs ;;
+                *) ;;
+esac
+
+# for debug use only
+#echo "platform=$PLATFORM"
+#echo "revision=$REVISION"
+#echo "package=$PACKAGE"
+#echo "FS=$FS"
+ 
+#######################################
+# Determine whether it supports ATA boot
+#
+case $PLATFORM in
+    "SWBD10" ) ATABOOT=0;;
+    "SWBD12" ) ATABOOT=0;;
+    "SWBD21" ) ATABOOT=0;;
+    "SWBD22" ) ATABOOT=0;;
+    "SWBD23" ) ATABOOT=0;;
+    "SWBD26" ) ATABOOT=0;;
+    "SWBD27" ) ATABOOT=0;;
+    "SWBD32" ) ATABOOT=0;;
+    "SWBD42" ) ATABOOT=0;;
+    *) ATABOOT=1;;
+esac
+
+##############################################
+# Let's get down to it and install this thing
+#
+echo "INSTALL26: INSTALL26ING for platform: $PLATFORM revision: $REVISION package $PACKAGE"
+
+#echo "INSTALL26: Finding module dependencies..."
+#if [ ! -h /lib/modules/`uname -r` ]; then
+#	ln -sf default /lib/modules/`uname -r`
+#fi
+#
+#do_command FALSE depmod -Aqe
+
+if [ ! -d /proc/ide/ide0 ]
+then
+    echo "INSTALL26: Starting services..."
+
+    do_command TRUE chkconfig pcmcia on
+    do_command TRUE /etc/rc.d/init.d/pcmcia start
+fi
+
+max_count=30
+echo -n "INSTALL26: Determining drive capacity (MAX $max_count sec)"
+
+count=0
+while [ ! -f /proc/ide/${DEVICE}/capacity -a $count -lt $max_count ]; do
+	echo -n "."
+	sleep 1
+	count=`expr $count + 1`
+done
+echo ""
+if [ $count -ge $max_count ]
+then
+    echo "INSTALL26: Failed to determine drive capacity. Perhaps pcmcia driver did not start correctly."
+    error=TRUE
+    exit_out
+fi
+
+echo "INSTALL26: Partitioning drive..."
+
+BLOCKS=`cat /proc/ide/${DEVICE}/capacity`
+((HALFMB = ($BLOCKS >> 12)))
+((ENDMB = 2 * $HALFMB))
+
+echo "INSTALL26: Drive Size: BLOCKS=${BLOCKS} HALFMB=${HALFMB} ENDMB=${ENDMB}"
+
+# Workaround until the page_alloc.c bug is fixed... -bk
+if [ "$PLATFORM" = "SWBD24" ]; then
+	((HALFMB = 128))
+	((ENDMB = 256))
+fi
+
+# first hammer any existent filesystem into oblivion
+printf "%1024s" fabos > /dev/hda
+
+# do partitioning setup
+echo "INSTALL26: Partition setup for /dev/${DEVICE} ..."
+echo "INSTALL26: Partition 1:  0  -  $HALFMB"
+echo "INSTALL26: Partition 2:  $HALFMB  -  $ENDMB"
+clobber_label               # Assure parted mklabel will work...
+do_command TRUE parted -s /dev/${DEVICE} mklabel msdos
+do_command TRUE parted -s /dev/${DEVICE} mklabel msdos
+do_command TRUE parted -s /dev/${DEVICE} mkpart primary $FS 0.000 $HALFMB.000
+do_command TRUE parted -s /dev/${DEVICE} mkpart primary $FS $HALFMB.000 $ENDMB.000
+do_command TRUE parted -s /dev/${DEVICE} print
+
+# create filesystems ext3 or xfs
+echo "INSTALL26: Creating $FS file system on /dev/${DEVICE}${partition}..."
+
+case "$FS" in
+   "ext3")
+      do_command TRUE mke2fs -g32768 -b4096 -j /dev/hda1
+      do_command TRUE tune2fs -c 0 -i 0 /dev/hda1
+      do_command TRUE mke2fs -g32768 -b4096 -j /dev/hda2
+      do_command TRUE tune2fs -c 0 -i 0 /dev/hda2
+   ;;
+   * )
+      do_command TRUE mkfs -t $FS $FSOPTS /dev/hda1
+      do_command TRUE mkfs -t $FS $FSOPTS /dev/hda2
+   ;;
+esac
+
+for partition in 1 2; do
+  if [ $continue = TRUE ]
+  then
+    #
+    # if this is a Ulysses box, then program the backplane mac address
+    #
+    if [ ${partition} -eq 1 ]
+    then
+	if [ -f ./$PLATFORM/bpmac -a "$PLATFORM" != "SWBD21" ]
+	then
+	    echo "INSTALL26: Setting up Private Ethernet mac address"
+	    do_command TRUE ./$PLATFORM/bpmac
+	fi
+    fi
+
+    if [ "$do_test" = NOTEST ]
+    then
+	echo "INSTALL26: Skipping the memory tests"
+    else
+	if [ "$do_test" = 1 ]
+	then
+	    echo "INSTALL26: Running the Read/Write memory tests"
+	else
+	    echo "INSTALL26: Running the EXTENDED memory tests"
+	fi
+
+	# use the platform specific sbin, default to 405 
+	if [ -f ./$PLATFORM/sbin/blockcheck ]
+	then
+	    echo "INSTALL26: Running ./$PLATFORM/sbin/blockcheck"
+	    ./$PLATFORM/sbin/blockcheck -t $do_test -v /dev/${DEVICE}${partition}
+	else
+	    echo "INSTALL26: Running ./sbin/blockcheck"
+	    ./sbin/blockcheck -t $do_test -v /dev/${DEVICE}${partition}
+	fi
+    fi
+
+    echo "INSTALL26: Mounting Primary FileSystem(/dev/${DEVICE}${partition}) on ${TMPMNT}..."
+    #echo "INSTALL26: fs=${FS}"
+    #echo "INSTALL26: device=${DEVICE}"
+    #echo "INSTALL26: partition=${partition}"
+    #echo "INSTALL26: tmpmnt=${TMPMNT}"
+
+    do_command TRUE mount -t $FS /dev/${DEVICE}${partition} ${TMPMNT}
+
+    #
+    # Install soft-link for modules
+    #
+    if [ ! -d /mnt/lib ]; then
+       do_command TRUE mkdir /mnt/lib
+    fi
+    if [ ! -d /mnt/lib/modules ]; then
+       do_command TRUE mkdir /mnt/lib/modules
+    fi
+    do_command TRUE ln -sf default /mnt/lib/modules/`uname -r`
+
+    #
+    # Make sure groups are installed.
+    #
+    if [ ! -d /mnt/etc ]; then
+       do_command TRUE mkdir /mnt/etc
+    fi
+    do_command TRUE cat ./$PLATFORM/group > /mnt/etc/group
+#    do_command FALSE cat > /mnt/etc/group << EOF
+#root::0:root
+#bin::1:root,bin,daemon
+#daemon::2:root,bin,daemon
+#sys::3:root,bin,adm
+#EOF
+    #
+    # Create fabos/lib
+    #
+    if [ ! -d /mnt/fabos ]; then
+       do_command TRUE mkdir -p /mnt/fabos/share
+    fi
+    if [ ! -d /mnt/fabos/lib ]; then
+       do_command TRUE mkdir /mnt/fabos/lib
+    fi
+
+    #
+    # Fix termcap / readline chicken and egg problem
+    #
+    do_command TRUE cp /lib/libtermcap.so.1.3 /mnt/lib
+
+    #
+    # Create device nodes and symlinks that can only be created
+    # at runtime.
+    # First the mtd symlinks
+    #
+    if [ ! -d /mnt/dev ]; then
+       do_command TRUE mkdir /mnt/dev
+    fi
+
+    while read var1 var2 var3 var4 var5
+    do
+	    # We do this check to get rid of initial comment string
+	    if [ "$var1" = "dev:" ];
+	    then
+		    continue;
+	    fi
+
+	    # What if its an empty line
+	    if [ "x$var1" = "x" ];
+	    then
+		    continue;
+	    fi
+	    # Strip devname off the ":"
+	    devname=${var1%:}
+
+	    # If var4 contains a ":" tmpvar will be NULL
+	    tmpvar=${var4##*:*}
+
+	    # Check if tmpvar is NULL
+	    if [ "x$tmpvar" = "x" ]; then
+		    # Build dev_alias with removing initial '"'
+		    dev_alias=${var4#\"};
+		    # dev_alias does not need the ending:
+		    dev_alias=${dev_alias%:};
+
+		    # Do the actual linking for the dev_alias->devname
+		    ln -s -f /dev/$devname /mnt/dev/$dev_alias
+                    #echo "INSTALL26:creating link: /dev/$devname /mnt/dev/$dev_alias"
+	    fi
+    done </proc/mtd
+
+    # Next the platform device
+    node="platform"
+    major=`grep $node\$ /proc/devices | cut -d ' ' -f 1`
+    if [  $major ]; then
+	rm -f /mnt/dev/$node
+	mknod  /mnt/dev/$node c $major 0
+    fi
+
+    installrpms $PACKAGE.plist ${TMPMNT}
+
+    copy_image_lists $PACKAGE.plist version.conf ${TMPMNT}
+
+    reset_glibc ${TMPMNT}
+
+    ####################################
+    # Run platform specific install if required
+    #if [ -f $PLATFORM/install ]
+    #then
+    #echo "INSTALL26: Running $PLATFORM/install"
+    #$PLATFORM/install $PLATFORM $PACKAGE
+    #fi
+
+    ####################################
+    # load the manufacturing additions
+    # After the normal rpm's and PLATFORM specific process has been completed,
+    # then install the manufacturing overlays it they exist. We must be 
+    # specific, and only take this action if the PACKAGE is factory or 
+    # development. DO NOT do this for the release SW.
+
+    if [ "$PACKAGE" = factory -o "$PACKAGE" = development -o "$PACKAGE" = foslight ]
+    then
+	for fil in `ls ./$PLATFORM/Mfgtests/*/* 2>/dev/null`
+	do
+	    script=`echo $fil | cut -d"/" -f4-`
+	    echo "INSTALL26: Loading $script"
+	    do_command TRUE cp $fil /mnt/fabos/$script
+	    do_command TRUE chmod 0755 /mnt/fabos/$script
+	    do_command TRUE chgrp factory /mnt/fabos/$script
+	    # if there are additions for manufacturing, then the rpm -V that 
+	    # happens during boot (controlled by the NoSysTest boot 
+	    # environment variable) will most likely fail, so turn of the
+  	    # the rpm -V (only once though).
+	done
+    fi
+
+    echo "INSTALL26: Updating the file system table..."
+
+    cat > ${TMPMNT}/etc/fstab << EOF
+/dev/root	/		$FS	rw,noatime	0 0
+none		/proc		proc	defaults	0 0
+none		/dev/pts	devpts	mode=620	0 0
+EOF
+
+    echo "INSTALL26: Fixing up pdm wrong directory for rcp"
+    do_command TRUE ln -sf ../usr/bin/rcp /mnt/bin/rcp
+
+    echo "INSTALL26: Fixing up /etc/modules.conf..."
+
+    do_command TRUE cat > /mnt/etc/modules.conf << EOF
+keep
+path=/fabos/modules
+alias eth1 eepro100
+EOF
+
+    echo "INSTALL26: Fixing fabos/sbin/sname"
+    if [ ! -x /mnt/fabos/sbin/sname ] ; then
+          ln -sf ../bin/sname /mnt/fabos/sbin/sname
+    fi
+
+    echo "INSTALL26: Setting up release file"
+    # use the platform specific sbin, default to 405 
+    if [ -f ./sbin/create_release_file ]
+    then
+       echo "INSTALL26: Running ./sbin/create_release_file"
+       ./sbin/create_release_file -p $PLATFORM -l $PACKAGE
+    else
+       if [ -f ./$PLATFORM/sbin/create_release_file ]
+       then
+          echo "INSTALL26: Running ./$PLATFORM/sbin/create_release_file"
+          ./$PLATFORM/sbin/create_release_file -p $PLATFORM -l $PACKAGE
+       else
+          echo "INSTALL26: Unable to Setup create_release_file"
+	  error=TRUE
+	  exit_out
+       fi
+    fi
+
+    #
+    # Remove circular link.
+    #
+    echo "INSTALL26: Remove circular link in /lib/modules"
+
+    rm /mnt/lib/modules/`uname -r`/default 2>/dev/null 1>&2
+
+    if [ "$PACKAGE" = foslight ]
+    then
+	echo "INSTALL26: DISABLE POST ..."
+
+	# only disable POST on the first partition
+	if [ ${partition} -eq 1 ]
+	then
+		do_command TRUE touch /mnt/var/diagd.skippost 2>/dev/null
+		do_command TRUE rm -f /mnt/etc/config/fabos  2>/dev/null
+		do_command TRUE echo "off" > /mnt/etc/config/fabos
+	fi
+    fi
+
+    if [ "$PACKAGE" = factory -o "$PACKAGE" = dvt -o "$PACKAGE" = nfdiag ]
+    then
+	echo "INSTALL26: Fixing up /etc/config entries..."
+
+	# only turn off fabos on the first partition
+	# This allows manufacturing process to use fruinit on clean install
+	# and having the second partition on allows for badrootdev support
+	# during power cycle tests.
+	if [ ${partition} -eq 1 ]
+	then
+	    do_command TRUE rm -f /mnt/etc/config/fabos  2>/dev/null
+	    do_command TRUE echo "off" > /mnt/etc/config/fabos
+	    do_command TRUE rm -f /mnt/etc/config/foslight  2>/dev/null
+	    do_command TRUE echo "on" > /mnt/etc/config/foslight
+	    do_command TRUE rm -f /mnt/etc/config/chubby  2>/dev/null
+	    do_command TRUE echo "off" > /mnt/etc/config/chubby
+	fi
+	# turn off the login timeout
+	do_command TRUE cat > /mnt/etc/idle.conf << EOF
+0
+EOF
+	do_command TRUE rm -f /mnt/etc/config/webtools 2>/dev/null
+	do_command TRUE rm -f /mnt/etc/config/fwd 2>/dev/null
+	do_command TRUE rm -f /mnt/etc/config/evmd 2>/dev/null
+	do_command TRUE rm -f /mnt/etc/config/snmpd 2>/dev/null
+	do_command TRUE rm -f /mnt/etc/config/swdd 2>/dev/null
+	do_command TRUE rm -f /mnt/etc/config/wdtd 2>/dev/null
+
+	do_command TRUE echo "off" > /mnt/etc/config/webtools
+	do_command TRUE echo "off" > /mnt/etc/config/fwd
+	do_command TRUE echo "off" > /mnt/etc/config/evmd
+	do_command TRUE echo "off" > /mnt/etc/config/snmpd
+	do_command TRUE echo "off" > /mnt/etc/config/swdd
+	do_command TRUE echo "off" > /mnt/etc/config/wdtd
+
+	do_command TRUE rm -f /mnt/etc/rc.d/rc.pwdinit 2>/dev/null
+
+    fi
+
+   # nfdiag support
+   if [ "$PACKAGE" = "nfdiag" ]
+   then
+      if [ ${partition} -eq 1 ]
+      then
+         # Disable fabos
+         do_command TRUE echo "off" > /mnt/etc/config/fabos
+
+         # run nfdiag in init level 2
+         do_command TRUE ln -s ../init.d/network /mnt/etc/rc.d/rc2.d/S01network
+         do_command TRUE cp /mnt/nfabos/bin/diagrun.sh /mnt/etc/rc.d/rc2.d/S30diags
+      fi
+   fi
+
+    if [  $major ]; then
+        rm -f /mnt/dev/$node
+    	mknod  /mnt/dev/$node c $major 0
+    fi
+   
+    ####################################
+    # Copy kernel image to user flash only once
+    #
+    if [ ${ATABOOT} -eq 0 -a ${partition} -eq 1 ]
+    then
+	mtds=`cat /proc/mtd | grep kernel | cut -f1 -d: | xargs echo`
+	for mtd_dev in ${mtds} ; do
+	    echo "INSTALL26: Writing Kernel to partition ${mtd_dev} of Kernel Flash"
+	        do_command TRUE /mnt/sbin/flash_write \
+			-i /mnt/boot/zImage.tree.initrd -o /dev/${mtd_dev}
+	done
+    fi
+
+    ####################################
+    # Clear the panic dump partition
+    #
+    if [ ${partition} -eq 1 ]
+    then
+	mtds=`cat /proc/mtd | grep log | cut -f1 -d: | xargs echo`
+	for mtd_dev in ${mtds} ; do
+	    echo "INSTALL26: Clearing the partition ${mtd_dev} of Kernel Flash"
+		cat /dev/zero > /dev/${mtd_dev} 2> /dev/null
+	done
+
+    fi
+
+    ####################################
+    # touch /mnt/etc/fabos/upgrade_status1 and /mnt/etc/fabos/upgrade_state
+    # so that FSS will not overwrite these files after firmwaredownload -s on
+    # standby CP
+    touch /mnt/etc/fabos/upgrade_status1
+
+    ####################################
+    # touch /mnt/etc/fabos/lisenses to create blank
+    # license file for 24 bit licenses
+    touch /mnt/etc/fabos/licenses
+
+    #########################################################
+    # Generate kernel image map file and find its starting LBA
+    ##########################################################
+    # first a kludge to fix mapinst bug, remove /dev/fd*
+    do_command TRUE rm -rf /dev/fd* >/dev/null 2>&1
+    tmp=`/mnt/sbin/mapinst /mnt/boot/zImage.tree.initrd | cut -d ':' -f 2` 2>/dev/null
+    if [ ${partition} -eq 1 ]
+    then
+       OSLDR0=`printf "ATA()0x%x\n" $tmp`
+       echo "INSTALL26: mapinst generated $OSLDR0"
+    else
+       OSLDR1=`printf "ATA()0x%x\n" $tmp`
+       echo "INSTALL26: mapinst generated $OSLDR1"
+    fi
+   
+    # save bootenv & friends for use after fs is unmounted
+    if [ ${partition} -eq 1 ] ; then
+       echo "INSTALL26: save copy of bootenv for later use ..."
+       if [ ! -f /bin/bootenv  ]; then
+          do_command TRUE cp /mnt/sbin/bootenv /bin/.
+       fi
+       if [ ! -f /lib/libbootenv.so.1.0  ]; then
+          do_command TRUE cp /mnt/lib/libbootenv.so.1.0 /lib/.
+       fi
+    fi
+
+    # Store the checksums for ldconfig and ld.so
+    chroot $ROOT /sbin/getvf
+    vf_val=$?
+    if [ ${vf_val} -eq 1 ];  then
+        do_command TRUE cp $ROOT/etc/fabos/user_vf.db.default $ROOT/etc/fabos/user.db
+        echo "getvf returned $vf_val. VF Database is copied." >> $TMPMNT/var/log/user.log
+    else
+        echo "getvf returned $vf_val. Non-VF Database is copied." >> $TMPMNT/var/log/user.log
+    fi
+
+
+    echo "INSTALL26: Unmounting file system..."
+    do_command TRUE umount ${TMPMNT}
+
+  fi
+done
+
+####################################
+# Update boot environment
+#
+
+#
+# The new version of bootenv command checks the checksum 
+# of bootenv partition. This doesn't work on platforms
+# that don't support dual bootenv partitions and thus don't
+# have partition checksum. So we run bootenv with -i 
+# option to invalidate partition checksum first. This tell
+# bootenv command to ignore checksum. 
+#
+echo "INSTALL26: Setup of Boot Environment"
+bootenv  > /dev/null 2>&1
+if [ $? -ne 0 ]
+then
+  bootenv -i
+  do_command TRUE bootenv > /dev/null 2>&1
+fi
+
+echo "INSTALL26: Setting boot environment parameters..."
+# remove the system test override variable
+# NOTE do not use do_command on this because the variable may not exist,
+# and the command will return a fail status, but this is not an indication
+# of a failing install
+bootenv -u NoSysTest 2> /dev/null
+
+# The special characters in this bootenv variable value prevent the use of 
+# do_command. So I have copied the content of do_command here.
+bootenv -u LoadIdentifier 2> /dev/null
+bootenv -v LoadIdentifiers "Fabric Operating System;Fabric Operating System"
+
+#
+#Update OSLoader
+#
+if [ ${ATABOOT} -eq 1 ]
+then
+   do_command TRUE bootenv -v OSLoader "${OSLDR0};${OSLDR1}"
+else
+   do_command TRUE bootenv -v OSLoader 'MEM()0xF0000000;MEM()0xF0800000'
+fi
+
+do_command TRUE bootenv -v OSRootPartition "${DEVICE}1;${DEVICE}2"
+do_command TRUE bootenv -v AutoLoad 'yes'
+do_command TRUE bootenv -v InitTest 'MEM()'
+do_command TRUE bootenv -v OSLoadOptions 'quiet'
+do_command TRUE bootenv -v SkipWatchdog 'yes'
+# NOTE do not use do_command on this because the variable may not exist,
+# and the command will return a fail status, but this is not an indication
+# of a failing install
+bootenv -u BadRootDev 2> /dev/null
+bootenv -u SoftUpgrade 2> /dev/null
+bootenv -u Upgrade 2> /dev/null
+
+# Update some boot environment for nfdiag package
+# Overwrite OSLoadOption and run nfdiag in init level 2
+if [ "$PACKAGE" = "nfdiag" ]
+then
+   do_command TRUE bootenv -v OSLoadOptions '2'
+   if [ "$PLATFORM" = "SWBD55" -o "$PLATFORM" = "SWBD68" -o "$PLATFORM" = "SWBD81"]
+   then
+      bootenv -v bootcmd "setenv bootargs mem=\${mem} \${OSLoadOptions};ataboot;bootm 0x400000"
+      bootenv -v initrd_high "0x20000000"   
+   fi
+else
+   if [ "$PLATFORM" = "SWBD55" -o "$PLATFORM" = "SWBD68" -o "$PLATFORM" = "SWBD81"]
+   then
+      bootenv -v bootcmd "setenv bootargs mem=\${mem} \${OSLoadOptions};ataboot;bootm 0x400000"
+      bootenv -v initrd_high "0x20000000"   
+   fi
+fi
+	
+####################################
+# Output ending instructions
+#
+if [ -f $PLATFORM/ending_instructions ]
+then
+    cat $PLATFORM/ending_instructions
+else
+    echo ""
+    echo "INSTALL26: No platform specific instructions found."
+    echo "INSTALL26: You may now reboot the system."
+    echo ""
+    echo "INSTALL26: Be sure you have a console connection to the system before rebooting."
+    echo ""
+fi
+####################################
+# Output overall results
+#
+exit_out
