@@ -1,0 +1,11 @@
+#!/bin/sh
+
+
+#    Copyright (c) 2014 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#     	Platform specific install script. 
+#
+
+/sbin/flash_write -i /mnt/boot/bootsel.bin -o /dev/bootsel
