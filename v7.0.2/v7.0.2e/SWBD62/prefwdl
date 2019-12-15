@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+#    Copyright (c) 2006 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#
+#	It runs before downloading takes place.
+#
+#
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+#
+# Passed in version numbers
+#
+TO_MAJOR=$1
+TO_MINOR=$2
+TO_PATCH=$3
+
+DEBUG=0
+if [ $DEBUG = 1 ]; then
+	ECHO='echo -e'
+else
+	ECHO=:
+fi
+
+#
+# main()
+#
+$ECHO Requested version is ${TO_MAJOR}.${TO_MINOR}.${TO_PATCH} Type is $TYPE
+
+
+#
+# clean up to free up disk space on /mnt before firmwaredownload
+#
+/bin/rm -f /mnt/var/tracedump.dmp
+/bin/rm -rf /lost+found
+/bin/rm -rf /mnt/lost+found
+(cd /mnt/core_files && /sbin/core_tidy.sh 2> /dev/null; cd /core_files && /sbin/core_tidy.sh 2>/dev/null)
+exit 0

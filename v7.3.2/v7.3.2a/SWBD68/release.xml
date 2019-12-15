@@ -1,0 +1,12 @@
+<BrocadeFirmware>
+<FirmwareType>FOS</FirmwareType>
+<Version>
+<major>7</major>
+<minor>3</minor>
+<patch>2</patch>
+<build>a</build>
+<displayName>Fabric OS 7.3.2a</displayName>
+</Version>
+<CreationDate>2016-06-13_11:34:43-0700</CreationDate>
+<Platform numPackages="20">68</Platform>
+</BrocadeFirmware>

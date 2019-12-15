@@ -1,0 +1,328 @@
+#!/bin/sh
+
+
+#    Copyright (c) 1996-2004 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#      Verification of an install for a particular platform.
+#
+
+
+usage() {
+    program=`basename $0`
+
+    echo "Usage: $program <platform> <TEST | EXTENDED> package"
+    echo "  platform      <Optional> hardware must be this platform."
+    echo "  TEST          Perofrm read/write testing of compact flash memory."
+    echo "  EXTENDED      Perform extended testing of compact flash memory."
+    echo "  package       Package to install."
+
+    echo ""
+    echo "Platform \"$PLATFORM\" packages are:"
+    ls ./$PLATFORM/*.plist 2>/dev/null | cut -d"/" -f3 | cut -d "." -f1
+    exit 1
+}
+
+#
+# exit_out
+#
+exit_out()
+{
+    if [ $error = TRUE ]
+    then
+	echo "SCRIPT: verify FAILED with $warn_count warnings."
+	exit 1
+    else
+	if [ $warn_count -gt 0 ]
+	then
+	    echo "SCRIPT: verify PASSED with $warn_count warnings."
+	else
+	    echo "SCRIPT: verfiy PASSED."
+	fi
+	exit 0
+    fi
+}
+
+#
+# do_command <warn/error> <command...>
+#
+do_command()
+{
+    warn=$1
+    shift
+    $*
+    if [ $? -ne 0 ]
+    then
+	if [ $warn = TRUE ]
+	then
+	    echo "SCRIPT: Warning - failed $*"
+	    warn_count=`expr $warn_count + 1`
+	    return 1
+	else
+	    echo "SCRIPT: ERROR - failed $*"
+	    continue=FALSE
+	    error=TRUE
+	    exit_out
+	fi
+    fi
+    return 0
+}
+#
+# verify-rpms <plist> <root>
+#
+verifyrpms()
+{
+    /bin/rm -f /tmp/partition_error
+
+    LIST=$PLATFORM/$1
+
+    if [ ! -f $LIST ] || [ ! -r $LIST ]; then
+	echo "SCRIPT: Cannot open/read package list to verify."
+	exit 1
+    fi
+
+    if [ ! -z $2 ]; then
+	ROOT=$2
+    else
+        ROOT=/
+    fi
+
+    RPM="rpm  -V -p --root $ROOT"
+
+    echo "SCRIPT: Verifying  RPMs from $LIST rooted at $ROOT..."
+
+    for package in `cat $LIST | dd skip=18 bs=16 2> /dev/null | grep -v '#' | xargs`;
+    do
+	    result="`$RPM $package | \
+			grep -e '5' -e 'missing' -e 'failed' | \
+			grep -v ' c ' | \
+			grep -v '/etc/inittab' | \
+			grep -v '/etc/modules.conf' | \
+			grep -v '/etc/rc.d/rc.pwdinit' | \
+			grep -v '/etc/idle.conf' | \
+			grep -v '/fabos/share/SWBD' | \
+			grep -v '/etc/services' | \
+			grep -v '/etc/raslog.conf' | \
+			grep -v '/etc/config/webtools' | \
+			grep -v '/boot/bootrom.bin'`"
+	    if [ ! -z "$result" ]
+	    then
+		$RPM $package | \
+			grep -e '5' -e 'missing' -e 'failed' | \
+			grep -v ' c ' | \
+			grep -v '/etc/inittab' | \
+			grep -v '/etc/modules.conf' | \
+			grep -v '/etc/rc.d/rc.pwdinit' | \
+			grep -v '/etc/idle.conf' | \
+			grep -v '/fabos/share/SWBD' | \
+			grep -v '/etc/services' | \
+			grep -v '/etc/raslog.conf' | \
+			grep -v '/etc/config/webtools' | \
+			while read line
+		do
+			file=`echo "$line" | cut -d"/" -f3-`
+			if [ ! -f ./$PLATFORM/Mfgtests/$file ]
+			then
+			    echo ""
+			    echo "FAILED verify of rpm ${DEVICE}${partition} $package because of:"
+			    echo $line
+			    touch /tmp/partition_error
+			fi
+		done
+	    else
+		echo -n "."
+#		echo "passed verify of rpm ${DEVICE}${partition} $package"
+	    fi
+    done
+    if [ -f /tmp/partition_error ]
+    then
+	partition_error=1
+	/bin/rm -f /tmp/partition_error
+    fi
+}
+
+#
+# test_for_product <candidate>
+#
+test_for_product()
+{
+    # Normalize the argument
+    candidate=`echo $1 | tr "A-Z" "a-z"`
+
+    #
+    # Look up the name in the list of known names for the platform ID
+    #
+    target=`grep $PLATFORM platform_names`
+    if [ "$target" == "" ]
+    then
+	echo "SCRIPT: Unknown Platform found $PLATFORM"
+	usage
+    fi
+    if [ "`echo $target | grep $candidate`" = "" ]
+    then
+	# It is not the one we are, is it a different product?
+	if [ "`grep $candidate platform_names`" != "" ]
+	then
+	    # output error message if valid product, otherwise it is not a 
+	    # product argument, and we use PLATFORM
+	    echo "SCRIPT: Actual platform ($PLATFORM) does not match specified platform $1."
+	    echo "SCRIPT: ERROR - failed $0 $*"
+	    continue=FALSE
+	    error=TRUE
+	    exit_out
+	fi
+	echo FALSE
+    else
+	echo $PLATFORM
+    fi
+}
+
+#
+# test_for_test <candidate>
+#
+test_for_test()
+{
+    if [ "$1" = "TEST" ]
+    then
+	echo 1
+    else
+	if [ "$1" = "EXTENDED" ]
+	then
+	    echo 2
+	else
+	    echo FALSE
+	fi
+    fi
+}
+
+#
+# test_for_package <candidate>
+#
+test_for_package()
+{
+    abc=`echo $1 | tr -s '[:upper:]' '[:lower:]'`
+
+    #
+    # See if first parameter was a PACKAGE
+    #
+    if [ -f ./$PLATFORM/$abc.plist ]
+    then
+	echo $abc
+    else
+	echo FALSE
+    fi
+}
+#
+# parse the command line arguments
+#
+parse_arguments()
+{
+    # check explicitly for package and test parameters, and assume 
+    # anything else is the plaftorm validation
+    #
+    while [ $# -gt 0 ]
+    do
+	result=`test_for_product $1`
+	if [ "$result" = "FALSE" ]
+	then
+	    result=`test_for_test $1`
+	    if [ "$result" = "FALSE" ]
+	    then
+		result=`test_for_package $1`
+		if [ "$result" = "FALSE" ]
+		then
+		    printf "SCRIPT: Unknown parameter %s\n" $1
+		    usage
+		else
+		    PACKAGE=$result
+		fi
+	    else
+		do_test=$result
+	    fi
+	else
+	    PLATFORM=$result
+	fi
+	shift
+    done
+
+    #######################
+    # Check the parameters
+    #
+    if [ ! -f ./$PLATFORM/$PACKAGE.plist ]
+    then
+	printf "SCRIPT: Incorrect package %s\n" $PACKAGE
+	usage
+    fi
+
+    case $PLATFORM in
+	"SWBD12" ) REVISION=3;;
+	*) REVISION=0;;
+    esac
+}
+#------------------------------
+# BEGIN MAIN PART OF THE SCRIPT
+# BEGIN MAIN PART OF THE SCRIPT
+#------------------------------
+
+if [ -z `pwd | grep load` ]
+then
+    echo "SCRIPT: ERROR verification directory is not mounted on /load."
+    exit 1
+fi
+
+for mnt in `mount | cut -d" " -f3 | grep "/mnt"`
+do
+    umount $mnt
+done
+
+DEVICE='hda'
+TMPMNT='/mnt'
+
+warn_count=0
+continue=TRUE
+error=FALSE
+
+PLATFORM=`sin | \
+		  /bin/grep Platform | \
+		  /usr/bin/cut -d" " -f2 | \
+		  /usr/bin/cut -d"," -f1`
+
+REVISION=`sin | \
+		  /bin/grep Platform | \
+		  /usr/bin/cut -d" " -f4`
+
+######################
+# parse the arguments
+#
+parse_arguments $*
+
+##############################################
+# Let's get down to it and install this thing
+#
+echo "SCRIPT: VERIFYING installation for platform: $PLATFORM revision: $REVISION package $PACKAGE"
+
+for partition in 1 2; do
+  if [ $continue = TRUE ]
+  then
+    echo "SCRIPT: Checking file system on /dev/${DEVICE}${partition}..."
+
+    do_command FALSE mount /dev/${DEVICE}${partition} ${TMPMNT}
+
+    partition_error=0
+    verifyrpms $PACKAGE.plist ${TMPMNT}
+    echo ""
+    if [ $partition_error -ne 0 ]
+    then
+	echo "SCRIPT: verification FAILED on partition ${DEVICE}${partition}"
+	error=TRUE
+    else
+	echo "SCRIPT: verification PASSED on partition ${DEVICE}${partition}"
+    fi
+    echo "SCRIPT: Unmounting file system..."
+
+    do_command FALSE umount ${TMPMNT}
+  fi
+done
+
+exit_out

@@ -1,0 +1,4984 @@
+#!/bin/sh
+#
+#    Copyright (c) 2004-2009 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#
+#        This pre-install script will be run before firmware
+#        download or firmwarerestore starts.
+#
+MSG="
+There  is  a  problem  with  the  firmware  image  installed  on  the  server.
+The preinst file is in DOS format. Please reload the firmware image on server,
+using the right tool/options  (to prevent  DOS style  ASCII file conversions),
+and then retry firmwaredownload.  "; # comment so ^M will not impact MSG.
+
+check4dos() { if [ $# -gt 1 ] ; then echo "$MSG" ;  exit 5 ; fi ; } ; check4dos 1
+
+#
+# Note the extra space (above) at the end of the call "check4dos 1 "
+# This space is very important for it to work correctly.
+# In case of dos conversion it will add a ^M at the end of this space.
+# That will make it look like calling check4dos with 2 parameters,
+# and result in $MSG being printed out instead of the current failure
+# ": not a signal specification" which does not convey what exactly went wrong.
+#
+# This will not address all types of conversion errors though.
+# We have seen cases where ^M was added at the end of PATH below.
+# To address that a space has been added at the end of that line
+#
+
+#################################################################################
+# Attention!                                            						# 
+#																				#
+# Please do not remove these lines in all future merges. This define indicates	#
+# 8548 Rev 3.1 CPU is supported by this firmware. This define is not used in	#
+# the preinstall script, but it will be  used by the check_cpu script later!	#
+#																				#
+CP31SUPPORTED="Version Supports 8548 Rev 3.1 CP"								#
+#################################################################################
+
+# Trap / Ignore SIGINT so user cannot interrupt this script with ^C
+trap "" 2
+trap "" SIGPIPE
+PATH=/bin:/usr/bin:/sbin:/usr/sbin # adding comment to protect from DOS conversion
+
+#
+# Passed in version numbers
+#
+TO_MAJOR=$1
+TO_MINOR=$2
+TO_PATCH=$3
+
+CUR_MAJOR=0
+CUR_MINOR=0
+CUR_PATCH=0
+PREINST="preinstall"
+ENC_VERSION_STR="6.1.1_enc"
+ENC_VERSION_STR_DEV="6.1.1orion"
+CEE_VERSION_STR="6.1.2_cee"
+RELEASE_FILE="/tmp/release.plist"
+RESTORE_FILE="/mnt/fabos/share/release"
+DISPLAY_MARATHON_STRIKER_WARN_MSG=0
+#
+# When firmwaredownload is invoking this script,
+# TYPE should be NULL; when firmwarerestore is
+# invoking it, TYPE is "restore"
+#
+TYPE=$4
+
+#
+# Common variables
+#
+CHASSISCONFIG=/bin/getchassisconfig
+NULL=/dev/null
+if [ "$DEBUG" = 1 ]; then
+	ECHO='echo -e'
+else
+	ECHO=:
+fi
+
+# This should match the file name in src/lib/upgrade/upgrade.c
+STATUS_FILE=/tmp/fwdl_err.txt
+# clear status file
+echo > $STATUS_FILE
+echo " " > $STATUS_FILE
+if [ -z $TYPE ]; then
+	echo "The following item(s) need to be addressed before downloading the specified firmware:" >> $STATUS_FILE
+else
+	echo "The following items need to be addressed before restoring the specified firmware:" >> $STATUS_FILE
+fi
+
+#
+# Error codes - these have to match the error codes
+# in fwdl.h.
+#
+STS_OK=0
+ERR_CONF_LSANMATRIX=75		# FWDL_ERR_SECMODE 0x51
+STS_ERR=255
+
+RET_CODE=${STS_OK}
+RET=${STS_OK}
+OVERALL_STS=$STS_OK
+
+#
+# cpid
+#
+# Retrieve the current Control Processor ID
+#
+cpid() {
+	sed -n -e 's/^Control.\+No: \([[:digit:]]\{1,\}\)$/\1/gp'
+}
+
+#
+# swbd
+#
+# Retrieve the current system platform name, of the form "SWBDn", where n
+# is cardinal number, assuming a sin/hinv input stream.
+#
+swbd() {
+	sed -n -e 's/^.\+\(SWBD[[:digit:]]\{1,\}\).\+$/\1/gp'
+}
+
+# Determine the system platform identifier.
+SWBD=`sin | swbd 2> ${NULL}`
+CPID=`sin | cpid 2> ${NULL}`
+
+
+otherhost(){
+#        printf 10.0.0.$((5+$(othercp)))
+	case ${SWBD##SWBD} in
+	'62')
+	    printf 127.1.1.$((8 - CPID % 2))
+	    ;;
+	'77')
+	    printf 127.1.1.$((6 - CPID % 2))
+	    ;;
+	*)
+	    printf 10.0.0.$((6 - CPID % 2))
+	    ;;
+	esac
+}
+
+HASHOW="$(/fabos/bin/hashow)"
+hashow_cmd=$(ls /fabos/cliexec/hashow)
+if [ "$hashow_cmd" != "/fabos/cliexec/hashow" ]; then
+       	hashow_cmd="/fabos/bin/hashow"
+fi
+
+othercp(){
+        that=${HASHOW#*Remote CP \(Slot}
+        that="${that%%,*}"
+        printf $(($that - 5))
+}
+
+add_err_status(){
+	echo -e "$1" >> $STATUS_FILE
+}
+
+ha_role() {
+ 	case "$($hashow_cmd | ( read a; echo $a ))" in
+	    *Local*Active*)
+	    printf "ACTIVE"
+ 	    ;;
+	    *Local*Standby*)
+	    printf "STANDBY"
+ 	    ;;
+	    *"Not supported"*)
+	    printf "ACTIVE"
+ 	    ;;
+	    *)
+	    printf "STANDBY"
+	    ;;
+	esac
+}
+
+if [ $(ha_role) == "ACTIVE" ]; then
+    ACTIVECP=1
+fi
+
+ha_state() {
+    sync=`/fabos/cliexec/hashow | sed -n -e 's/^.\+\(State sync\).\+$/\1/gp'`
+
+    if [ "$sync" != "State sync" ]; then
+	    printf "NOSYNC"
+    else
+	    printf "SYNC"
+    fi
+}
+
+is_fwdl_arg() {
+
+	#
+	# Reads command line args passed to firmwaredownload
+	# and checks if the required argument is specified
+	#
+	for arg in $(/usr/bin/tr '\0' ' ' < /proc/$PPID/cmdline)
+	do
+            case $arg in
+            (-*$1*)
+		return $STS_OK
+		;;
+            esac
+        done
+        return $STS_ERR
+}
+
+allow_nondisruptive_fwdl() {
+	# Skip for restore
+	if [ -n "$TYPE" ]; then
+		$ECHO " running firmwarerestore"
+		return $STS_OK
+	fi
+
+    # Allow 6.1.2_cee <-> 6.3 HCL on Elara
+    # For others, allow only disruptive fwdl
+    case ${SWBD##SWBD} in
+    '76')
+        ;;
+    *)
+		is_fwdl_arg "s"
+		local singlemode=$?
+		is_fwdl_arg "f"
+		local forcemode=$?
+		if [ $singlemode -ne 0 -o $forcemode -ne 0 ]; then
+			return $STS_ERR
+		fi
+		;;
+	esac
+
+	return $STS_OK
+}
+
+allow_disruptive_single_mode_fwdl() {
+	# Skip for restore
+	if [ -n "$TYPE" ]; then
+		$ECHO " running firmwarerestore"
+		return $STS_OK
+	fi
+
+	is_fwdl_arg "s"
+	local singlemode=$?
+	if [ $singlemode -ne 0 ]; then
+		return $STS_ERR
+	fi
+
+	return $STS_OK
+}
+
+check_for_non_disruptive_fwdl() {
+	# Skip for restore
+	if [ -n "$TYPE" ]; then
+		$ECHO " running firmwarerestore"
+		return $STS_ERR
+	fi
+
+	is_fwdl_arg "s"
+	local singlemode=$?
+	if [ $singlemode -ne 0 ]; then
+		return $STS_OK
+	fi
+
+	return $STS_ERR
+} 
+
+check_autoreboot_opt() {
+	# Skip for restore
+	if [ -n "$TYPE" ]; then
+		$ECHO " running firmwarerestore"
+		return $STS_OK
+	fi
+
+	is_fwdl_arg "b"
+	local auto_reboot=$?
+	if [ $auto_reboot -eq 0 ]; then
+		return $STS_ERR
+	fi
+
+	return $STS_OK
+}
+
+TEST() {
+
+	$ECHO  -n "TEST $1 "
+	if [ $(ha_role) == "STANDBY" ] && [ $(ha_state) == "NOSYNC" ]; then
+	    return $STS_OK
+	fi
+
+	$1
+ 	if [ $? -ne $STS_OK ]; then
+		$ECHO "failed"
+		add_err_status "$2"
+		RET_CODE=$STS_ERR
+		return $STS_ERR
+	fi
+
+	$ECHO "passed"
+	return $STS_OK
+}
+
+
+CHASSISCMD=""
+cliidx=0
+export PATH=/fabos/link_bin:/bin:/usr/bin:/sbin:/usr/sbin:/fabos/link_abin:/fabos/link_sbin:/fabos/factory:/fabos/xtool
+export VFROLEMAP=-1:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0
+export CHASSIS_ROLEID=0
+
+context_switch()
+{
+    check_vf_enabled
+    if [ $? -ne $STS_OK ]; then
+        if [ "$1" != "chassis" ]
+        then
+            eval $(/fabos/cliexec/lscfg_util --switch $1)
+        else
+            eval $(/fabos/cliexec/lscfg_util --chassis)
+            #export CHASSIS_ROLEID=0
+        fi
+    fi
+    export ROLE_ID=root
+}
+
+cmd_chassis() {
+
+  context_switch chassis
+
+  if [ "$CONFIG" = "TRUE" ]; then
+    echo -n . > $TTY
+    cliidx=`/usr/bin/expr $cliidx + 1`
+    echo "$cliidx $1 $2 $3 $4 $5 $6 $7 $8 $9" >> $cshow
+    echo -e "$1 $2 $3 $4 $5 $6 $7 $8 $9:"
+      echo "** $1 $2 $3 $4 $5 $6 $7 $8 $9: Command:$rc **" >> $cshow
+  else
+    echo -e "$1 $2 $3 $4 $5 $6 $7 $8 $9:"
+    $1 $2 $3 $4 $5 $6 $7 $8 $9
+  fi
+}
+
+
+# Helper function. It sets the global variable CONTEXTS to be a list of fabric IDs.
+# Typical usage is seen in the function for_all_contexts, where we use CONTEXTS if it
+# is defined, and otherwise call this function. This means we only need to do
+# the configshow once for each run of preinst, rather than once for each test
+# that wants to run in all contexts
+get_all_contexts(){
+	CONTEXTS=$($CHASSISCMD /fabos/cliexec/configshow -all | sed -n 's/Fabric ID =//p')
+	echo $CONTEXTS
+}
+
+glb_ls_id=-1
+glb_vf_id=255
+def_vf_id=128
+
+# Helper function. Loop over the valid fabric IDs running the test that is passed as
+# a parameter. As soon as one test fails then return $STS_ERR. If all pass then
+# return $STS_OK.
+# WARNING. This command will change to a random context (The first one that fails
+# the test or the last context if all pass). Random terms in case someone is searching
+# this file, VF Virtual Fabric AD setcontext FID context and wants to find this warning
+for_all_contexts(){
+	for FID in ${CONTEXTS:-$(get_all_contexts)} ; do
+		context_switch $FID
+		glb_vf_id="$CURRENT_VF"
+		glb_ls_id="$FABOS_SWITCHNO"
+		if "$@"
+		then	$ECHO -n "$FID-passed "
+		else	$ECHO -n "$FID-failed "
+				return $STS_ERR
+		fi
+	done
+	return $STS_OK
+}
+
+for_all_contexts_standby(){
+	rval=$STS_OK
+	/bin/ln -s /fabos/cliexec/lscfg_util /fabos/link_sbin/lscfg_test 2> /dev/null
+	local_flag=$?
+	export PATH=/fabos/link_bin:/bin:/usr/bin:/sbin:/usr/sbin:/fabos/link_abin:/fabos/link_sbin:/fabos/factory:/fabos/xtool
+	lscfg_test --all | grep -e "[0-255]" | grep -v "Total" |
+	while read glb_ls_id glb_vf_id role
+	do
+		if "$@"
+		then	$ECHO -n "$glb_vf_id-passed "
+		else	$ECHO -n "$glb_vf_id-failed "
+			# note the following return just return from the "|" subshell
+			return $STS_ERR
+		fi
+	done
+	if [ $? -ne $STS_OK ]; then rval=$STS_ERR; fi
+	if [ $local_flag -eq 0 ];then /bin/rm /fabos/link_sbin/lscfg_test 2> /dev/null; fi
+	return $rval
+}
+
+
+###################################################
+### The messages are for firmwarerestore.	###
+###################################################
+FWDL_RUNNING_MSG="Firmwaredownload or firmwarecommit is already running. Please wait for it to complete first."
+FWRESTORE_DISALLOWED_MSG="No need to run firmwarerestore because firmware has already been committed, or there is no firmwaredownload performed."
+FWRESTORE_VER_DISALLOWED_MSG="Firmwarerestore from v6.3.x to v6.1.2_cee is not supported. Please run firmwarecommit first and then download the new firmware."
+
+###################################################
+###################################################
+####                                           ####
+####                                           ####
+####     PRESINSTALL MESSAGES SECTION          ####
+####    ------------------------------         ####
+####                                           ####
+###################################################
+###################################################
+IRONMANMSG="The FC4-16IP (type 31) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+POSITRONMSG="The FC4-48 (type 36) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+SCIMITARMSG="The FA4-18 (type 33) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+SABREMSG="This platform is not supported by the target firmware. Please try to download another firmware."
+XENONMSG="The FC10-6 (type 39) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+TRITONMSG="The FC8-48 (type 51) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+LARISSAMSG="The FC8-32 (type 55) is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+DESPINAMSG="The FC8-16 (type 37) is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+MACEMSG="This platform is not supported by the target firmware. Please try to download another firmware."
+LANCEMSG="The FS8-18 (type 43) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+EUROPAMSG="The FCOE10-24 (type 74) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+STRIKERMSG="The FX8-24 (type 75) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first."
+QUATTROMSG="The FC8-64 (type 77) blade is not supported by the target firmware. Please use slotshow to find out which slot it is in and remove it first. For VF enabled switch, use \"lscfg --restore_to_default FID\" to move all vacant ports in this slot to the default after removing the blade."
+ADSPOLICYMSG="ADS policy of Access Gateway is enabled. Please use \"ag --policydisable ads\" to remedy this."
+UNSUPPORTED_DL_VERMSG="Cannot downgrade to 6.2 or lower. Please downgrade to 6.3 first and then download the desired firmware version."
+UNSUPPORTED_UP_VERMSG="Cannot upgrade directly to 7.0. Please upgrade to 6.4 first and then upgrade to 7.0."
+UNSUPPORTED_EUROPA_BLADE_COUNT="Exceeded maximum number of FCOE10-24 (type 74) blade count supported by the target firmware. Maximum 2 FCOE10-24 blades are supported. Please use slotshow to find the slots in which these blades are and remove the excess blades."
+UNSUPPORTED_NON_DISRUPTIVE_MODE_FWDL="Non disruptive firmwaredownload is not supported when firmwaredownload with two versions apart. Please try to use \"firmwaredownload\" with single mode option enabled."
+UNSUPPORTED_SINGLE_MODE_AUTOREBOOT_OPT="firmwaredownload from 6.3 to 7.0 with -sb option is not allowed. Please try \"firmwaredownload -s\" and reboot the CP after firmware is downloaded."
+UNSUPPORTED_AUTOREBOOT_OPT_WARN_MSG="auto reboot option is not allowed with single mode when upgrade from 6.3 to 7.0. Please make sure that auto-reboot is not enabled before proceeding."
+UNSUPPORTED_VF_DISABLE_MSG="Downgrade is not allowed because VF is enabled. Please run \"lscfg --config\" and \"lscfg --delete\" commands to remove the non-default LS first, then run \"fosconfig --disable vf\" to disable VF before proceeding."
+UNSUPPORTED_ETHSW_DISABLE_MSG="Downgrade is not allowed because Ethernet Switch Service is enabled. Please run \"fosconfig --disable ethsw\" command to disable it before proceeding."
+UNSUPPORTED_AG_ON_SPIRIT_MSG="Downgrade is not allowed because AG is enabled. Please run \"ag --modedisable\" command to disable AG mode before proceeding."
+UNSUPPORTED_AG_ON_MACE_MSG="Downgrade is not allowed because AG is enabled. Please run \"ag --modedisable\" command to disable AG mode before proceeding."
+UNSUPPORTED_AG_ON_ELARA_MSG="Downgrade is not allowed because AG is enabled. Please run \"ag --modedisable\" command to disable AG mode before proceeding."
+AG_QOS_PORT_ACTIVE_MSG="Downgrade is not allowed because one or more ports are in active QoS(AoQ) mode. Please use \"portdisable [slot/]port\" command to disable the ports in active QoS mode."
+QOS_DI_ZONE_EXISTANCE_MSG="Downgrade is not allowed because defined and/or active configurations have QoS DI zones in one or more contexts. Please use \"zonedelete zone_name\" command to delete the QoS DI Zones before proceeding."
+ETIZ_EXISTANCE_MSG="Downgrade is not allowed because zoning configuration has overlapping (enhanced) TI zones in one or more contexts. Please use \"zone --delete zone_name\" command to delete overlapping TI Zones before proceeding."
+AGPGMODESMSG="One or more port groups are operating in a special mode (lb, mfnm, etc). Please use \"ag --pgdelmodes\" to remedy this."
+PID_CORE_MSG="PID Format needs to be set to Core. Please use \"switchdisable\" to disable the switch then use \"configure\" to change the Switch PID Format."
+PERF_MSG="Upgrade is not allowed because both Top talker monitors and FC Router are configured and the new firmware doesn't support co-existence of both the features. Pleae use \"perfttmon --del\" or \"fosconfig --disable fcr\" commands to delete top talkers or disable FC Router feature before upgrading."
+METEORPLATFORMMSG="Cannot upgrade to firmware v6.1. This firmware does not support Silkworm 24000 platform."
+NON_ENC_PLATFORMMSG="This platform is not supported by the target firmware. Please try to download another firmware."
+UNSUPPORTEDPLATFORMMSG="Cannot download the requested firmware because the firmware doesn't support this platform. Please enter another firmware path."
+TACONFIGUREDMSG="Downgrade is not allowed because one or more trunk areas have been configured. Please use \"porttrunkarea --disable\" to disable trunk areas before downgrading."
+CRRECOVCONFIGUREDMSG="Downgrade is not allowed because one or more ports have credit recovery enabled. Please use \"islshow\" to show ports with credit recovery. Use the command \"portdisable\" to disable credit recovery ports."
+LSANMATRIXMSG="Firmware to downgrade does not support the FCR matrix. Please use the fcrlsanmatrix CLI command to put the FCR matrix configuration back to default since this feature will not be supported in the older firmware."
+TEMPLICENSEPRESENT="Temporary license is present on the switch. Please remove that before performing firmware downgrade."
+AGTRUNKCONFIGUREDMSG="One or more N_Port trunks are enabled. Downgrade is not allowed because one or more trunk areas have been configured on the switch attached to this AG. Please execute \"porttrunkarea --disable\" CLI on the attached switch to remedy this."
+DOWNGRADEWITHC2EX="One or more Integrated Routing EX_Ports are enabled. Please use \"portcfgexport\" CLI to disable these ports before continuing."
+DOWNGRADEWITHVEX="VEX on FX8-24 requires firmware version 6.4 or higher. Please use \"portcfgvexport\" CLI to remove VEX configuration before continuing."
+DOWNGRADEWITH7500EMSG="7500E platform is not supported by the target firmware. Please try to download another firmware version. 7500E requires FOS V6.1.1 or higher."
+MAXFCPORTSEXCEEDED_7500EMSG="Exceeded maximum number of FC ports for 7500E configuration. Only FC ports 0 and 1 are allowed to be used for 7500E. Please use \"portcfgpersistentdisable\" to persistently disable all remaining FC ports and try again, or install the 7500E Upgrade License."
+MAXTUNNELEXCEEDED_7500EMSG="Exceeded maximum number of tunnels for 7500E configuration. Only 1 FCIP tunnel configuration allowed per GE port. Please use \"portcfg fciptunnel\" or \"portcfgdefault\" to remove any extra tunnel configurations and try again, or install the 7500E Upgrade License."
+MAXBANDWIDTHEXCEEDED_7500EMSG="Exceeded maximum bandwidth allocation for 7500E configuration. Minimum bandwidth is 1400 and maximum bandwidth is 50000 (50Mbps). Please use \"portcfg fciptunnel\" or \"portcfgdefault\" to set a commited rate in range for all FCIP tunnels and try again, or install the 7500E Upgrade License."
+FCIPTAPEACC_7500EMSG="The 7500E does not support the tape pipelining feature. This is only available via upgrade license. Please use \"portcfg fciptunnel\" or \"portcfgdefault\" to remove the tape pipelining funcionality for all FCIP tunnels and try again, or install the 7500E Upgrade License."
+FCIPIPSEC_7500EMSG="The 7500E does not support the IPSec feature. This is only available via upgrade license. Please use \"portcfg fciptunnel\" or \"portcfgdefault\" to remove all IPSec policies from the FCIP tunnels and try again, or install the 7500E Upgrade License."
+FCIPFICON_7500EMSG="The 7500E does not support FICON emulation. This is only available via upgrade license. Please use \"portcfg ficon\" or \"portcfgdefault\" to remove any FICON tunnels and try again, or install the 7500E Upgrade License."
+DOWNGRADE_WITH_C2_PORT_MIRROR="Downgrade is not allowed because port mirroring is enabled for one or more ports. Please use \"portcfg mirrorport\" and \"portmirror --show in Default and in all Logical switches (if any)\" to disable them before downgrading"
+TIFCRCONFIGUREDMSG="Downgrade is not allowed because one or more TI over FCR zones have been configured. Please use \"zone --remove\" or \"zone --delete\" to remove/delete them before downgrading."
+IOD_DELAY_CONFIGURED="Downgrade is not allowed because IOD Delay value is configured for one or more domains. Please use \"ioddelayshow and ioddelayreset\" to disable them before downgrading."
+RDINTEROP2CONFIGUREDMSG="Downgrade is not allowed because Frame Redirect zones are configured with McDATA Interop Mode enabled. Use \"interopmode\" and/or \"zone --rddelete\" commands."
+RDINTEROP3CONFIGUREDMSG="Downgrade is not allowed because Frame Redirect zones are configured with McDATA Open Mode enabled. Use \"interopmode\" and/or use \"zone --rddelete\" commands to remove/delete them before downgrading."
+DOMOFFSETINTEROPCONFIGMSG="Downgrade is not allowed because McDATA/OpenMcData Mode is enabled and domain offset is not configured to default McDATA/OpenMcData offset. Use \"interopmode\" command to remove/delete/reconfigure/modify them before downgrading."
+MSFRZONEORCFGNAMEFOUNDMSG="Upgrade is not allowed because one of the Zones or configs defined on this switch is using a reserved naming prefix \"msfr_zn\" or \"msfr_cfg\" please rename them before upgrading."
+SWITCH_FAULTY_MSG="Firmwaredownload is not allowed since the switchState is Faulty. Use \"switchShow\" to see the switch state. Please recover the switch before proceeding."
+
+AG_QOS_PORT_ACTIVE_FABRIC_SIDE_MSG="Downgrade is not allowed because one or more F-ports on the switch are connected to AG (with active QoS). Please use \"portdisable [slot/]port\" command to disable those F-ports."
+UNSUPPORTED_PERSISTENT_ALPA_ON_DOWNGRADE="Downgrade is not allowed because persistent alpa is enabled. Please use \"ag --persistentalpaenable 0\" to disable the feature before downgrading."
+UNSUPPORTED_EEMON_ON_DOWNGRADE="Downgrade is not allowed when end to end monitors are installed in AG. Please use \"perfDelEEMonitor \" to clear the end to end monitors installed before downgrading."
+UNSUPPORTED_FMON_ON_DOWNGRADE="Downgrade is not allowed when frame monitors are installed in AG. Please use \"fmMonitor --delete \" to clear the frame monitors installed before downgrading."
+UNSUPPORTED_LICENSES_ON_DOWNGRADE="Downgrade is not allowed because enhanced licenses are installed. Please remove them before downgrading."
+UNSUPPORTED_STATICFPORTS_CONFIG_ON_DOWNGRADE="Downgrade is not allowed because static F-ports are configured. Please use \"ag --show \" to check for static F-ports and \"ag --staticdel <N-port> <F-ports>\" to delete the static mapping before downgrading."
+UNSUPPORTED_SFLOW_ON_DOWNGRADE="Downgrade is not allowed because sflow is enabled in startup/running config. Please use \"show running-config/show-startup-config\" to check sflow config and remove them before downgrading."
+UNSUPPORTED_SFLOW_ON_DOWNGRADE="Downgrade is not allowed because sflow is enabled in startup/running config. Please use \"show running-config/show-startup-config\" to check sflow config and remove them before downgrading."
+UNSUPPORTED_DOT1X_ON_DOWNGRADE="Downgrade is not allowed because dot1x is enabled in startup/running config. Please use \"show running-config/show-startup-config\" to check dot1x config and remove them before downgrading."
+UNSUPPORTED_SYSTEMCARD_FEATURE_ON_DOWNGRADE="Downgrade is not allowed because System Card is enabled. Please use \"cryptocfg --set -systemcard disable\" to disable System Card feature before downgrading."
+UNSUPPORTED_QOURUMCARD_SIZE_NON_ZERO="Downgrade is not allowed because Qourum size is greater than zero. Please change the qourum size to zero before downgrading."
+UNSUPPORTED_TWO_RKM_KVS_UPGRADE="Upgrade is not allowed because Secondary RKM KV is registered. Please use \"cryptocfg --dereg -keyvault <label> \" to deregister the secondary KV and then try again."
+UNSUPPORTED_TWO_SKM_KVS_DOWNGRADE="Downgrade is not allowed because Secondary SKM KV is registered. Please use \"cryptocfg --dereg -keyvault <label> \" to deregister the secondary KV and then try again."
+UNSUPPORTED_DISK_TAPE_COEXIST="Downgrade is not allowed because disk and tape containers are hosted on same EE. Please move them to different EEs before downgrading."
+AREA_ASSIGNED_BEYND_MAXPHPORTS="Downgrade is not allowed because one or more of the areas assigned is greater than the maximum number of physical ports on the platform. Please user \"portaddress --show\" to display the areas currently assigned and \"--unbind and --bind\" to bind an area below max_phy_ports".
+UNSUPPORTED_PASSWDCFG_HISTORY_VALUE="Downgrade is not allowed because passwdcfg.history value of 0 is not supported.  Please set the history value in a range of 1 - 24 before downgrading."
+UNSUPPORTED_PORTFENCING_STATECHANGEMSG="Portfencing is enabled for State Change events. Kindly disable before downgrade"
+WEBLINKER_MSG="Both http and Secure http are disabled. Please use \"webdconfigure\" command to enable http."
+UNSUPPORTED_LS_PORTS_MSG="Downgrade is not allowed because a range of ports not supported by the target firmware are assigned to Logical Switches instead of Default Switch. Please use \"lscfg --restore_to_default FID\" to move all vacant ports to the default."
+UNSUPPORTTED_SEC_AUTH_CERTIFICATE_DATABASE_VALUE="Downgrade is not allowed because either 1) One of the peer switch is configured to use third party issued certificates, or 2) Certificate files exist. Please remove or set the configuration to Brocade and delete certificate files using \"seccertutil delete -fcapall\" before downgrading."
+UDROLE_DELETE_DOWNGRADE_MSG="The user-defined roles on the switch will be deleted after downgrade."
+UDROLE_USERS_FWDL_DISALLOWED_MSG="Downgrade is not allowed because there are users with user-defined roles. Please use \"userconfig --change\" to assign default roles to the users or \"userconfig --delete\" to delete the users."
+UDROLE_FWDL_DISALLOWED_MSG="Downgrade is not allowed because user-defined roles are present. Please use \"roleconfig --show -all\" to check all the UD Roles and \"userconfig --show -all\" to check any users assigned these roles.If there are such users, use \"userconfig --change\" to assign default roles to the users or \"userconfig --delete\" to delete the users. Then remove the UD Roles with \"roleconfig --delete\""
+VEX_PORT_DISALLOWED_MSG="Downgrade is not allowed because there are ports configured on FX8-24 as VEX. Please use \"portcfgvexport CLI\" to remove the VEX configuration"
+STRIKER4BLADESUPPORT_DISALLOWED_MSG="Downgrade is not allowed because there are more than 2 FX8-24 blades plugged in to the chassis. The limit after downgrade is 2. Please plug out the extra blades and rerun the command"
+CSCTL_DISALLOWED_MSG="Downgrade is not allowed because there are ports configued in CSCTL mode. Please use \"portcfgqos CLI\" to disable the CSCTL mode"
+UNSUPP_DYN_AREA_ON_DEF_SW="Downgrade is not allowed because dynamic area mode is enabled on default switch, Please use \"configure\" CLI to turn this mode off"
+UNSUPPORTED_ZONE_SIZE="Downgrade is not allowed because the existing zone configuration is more than 1MB. To downgrade to lower firmware version modify the existing zone configuration to 1MB or lesser."
+UNSUPPORTED_PERSISTENT_PID_ON_DOWNGRADE="Downgrade is not allowed because Persistent PID is enabled. Please use \"ag --persistentpidenable 0\" to disable the feature before downgrading."
+UNSUPPORTED_WWNBAL_POLICY_ON_DOWNGRADE="Downgrade is not allowed because AG WWN balancing policy is enabled. Please use \"ag --policydisable wwnloadbalance\" to disable the feature before downgrading."
+UNSUPPORTED_AGWWN_STATICMAP_ON_DOWNGRADE="Downgrade is not allowed because AG static WWN mappings are configured. Please use \"ag [--delwwnmapping|--delwwnpgmapping]\" to delete the mappings before downgrading."
+LOCKED_EPORT_DISALLOWED_MSG="Downgrade is not allowed because one or more ports are locked as E-port.Please use \"portcfgeport\" CLI to remove the lock."
+PORTNAME_LEN_DISALLOWED_MSG="Downgrade is not allowed because one or more ports name length is greater than 32 bytes. Please use \"portname\" CLI to check and fix the port name/length before downgrading."
+PORTSPEED_DISALLOWED_MSG="Downgrade is not allowed because one or more ports have speed configured as 10G/16G speed. Please remove unsupported blades CR8510(4)-16/CR8510-16 if present and use \"portcfgspeed\" CLI to change the speed before downgrading."
+PAD_FEATURE_CHECK_MSG="Downgrade is not allowed because for one or more ports Port Auto Disable (PAD) is enabled with no options configured. Need to disable PAD for those ports first. Use \"portcfgautodisable\" CLI for command usage."
+CONDOR3_BLADE_IS_PRESENT="FC16-32, FC16-48, CR8510(4)-16, and CR8510(8)-16 are not supported by the targeted firmware. Please use slotshow to determine which of these are installed and remove them before continuing."
+UNSUPPORTED_ENCRYPTION_VERSIONING_DT="Downgrade is not allowed because Disk Tape coexistence feature is in use. Please delete/move either tape or disk container from the hosting  EE/HAC member. Please refer to Encryption admin guide (6.4.x) for more information."
+UNSUPPORTED_ENCRYPTION_VERSIONING_REPL="Downgrade is not allowed because Replication feature is in use. Please use \"cryptocfg --set -replication disable\" to disable replication."
+UNSUPPORTED_ENCRYPTION_VERSIONING_DEC="Downgrade is not allowed because Device decommission feature is in use. Please use \"cryptocfg --delete -decommissionedkeyids\" to disable Device decommission. Make sure that there is no lun undergoing decommission, or is in failed state."
+CFG_FILL_WORD="Downgrade is not allowed because fillword has been configured as > 1 for one or more ports which requires firmware version 6.3.x or higher. Please use \"portcfgfillword\" CLI to remove fillword configuration before downgrading."
+UNSUPPORTED_LOSSLESS_DPS_ON_DOWNGRADE="Downgrade is not allowed because Lossless is enabled.  If Virtual Fabric is enabled, then Lossless is enabled on at least one logical switch. Please use \"dlsset --disable -lossless\" (on each logical switch, if Virtual Fabric) to disable the feature before downgrading."
+UNSUPPORTED_FCOE_VE_PORTS_ON_DOWNGRADE="Downgrade is not allowed because FCoE VE ports are enabled. Use \"switchShow\" to get the list of FcoE VE ports. Please disable them before proceeding."
+XFCIP_TERADATA_MSG="Teradata FICON emulation support for 7800/FX8-24 requires firmware version v6.4.1_fcoe or higher. Please remove or disable any Teradata FICON emulation configurations using the \"portCfg fciptunnel <ve-port> delete\" or \"portCfg fciptunnel <ve-port> modify\" command before downgrading."
+FCOE_PROVISION_CONFIG_MSG="With the current upgrade/downgrade, the CEE start up configuration dcf.conf file will be incompatible with FCoE provisioning changes as part of this build. CEE start up configuration file, dcf.conf can be backed up for future use. The user can save the configuration as backup and apply it once upgrade/downgrade is complete, to restore the switch configuration in its respective build version. If you wish to save the configuration file please abort firmware download and save the configuration file before proceeding."
+UNSUPPORTED_HIF_ON_DOWNGRADE="Downgrade is not allowed because HIF mode is enabled. To Downgrade to lower version please disable HIF mode using DCFM before downgrading."
+UNSUPPORTED_INTEROP_MODE="Upgrade to 7.0 is not allowed when interopmode is enabled. To upgrade, please disable interopmode."
+XFCIP_FEATURE_RESTRICTION="Downgrade is not allowed because some FCIP features are enabled and are not supported on the selected version. Please address these unsupported features before downgrading."
+CONDOR_EX_PORT_RESTRICTION="Upgrade to selected version is not allowed because EX-Ports are configured on FR4-18i blade(s). Please remove EX-port configuration using \"portcfgexport\" CLI on the ports."
+NOS_EX_PORT_RESTRICTION="Downgrade to selected version is not allowed because EX-Ports are configured in Brocade NOS Interop-mode. Please remove EX-port configuration using \"portcfgexport\" CLI on the ports."
+BUF_OP_ENABLED="Downgrade is not allowed because buffer optimized mode is enabled. Please use \"bufopmode --showall\" to view the buffer optimized mode for the slots and \"bufopmode --reset <slot>\" to disable the feature for those slots before downgrading."
+UNSUPPORTED_ENCRYPTION_VERSIONING_SSZ="Downgrade is not allowed because single step zeroization is enabled. Please use \"cryptocfg --set -singlestep_zeroize disable\" to disable single step zeroization before downgrading."
+UNSUPPORTED_VEPORT_THRESHOLD_CONFIG="Downgrade is not allowed because high/low threshold for VE-Port on the switch(s) is configured to decimal value. Kindly configure the threshold to a integer value and downgrade."
+UNSUPPORTED_MULTIPLE_EMAIL_FW_ALERT="Downgrade is not allowed because Multiple recipient addresses might have been configured on any of the logical switches for any of the class to receive Fabric Watch email alerts. Please use "fwMailCfg" CLI command to configure single recipient address before downgrading."
+UNSUPPORTED_BRCD_CERTIFICATE_DATABASE_VALUE="Upgrade to 7.0 is not allowed because either 1) FCAP authentication to one of the neighboring switches is configured to use Brocade issued certificates, or 2) Brocade Certificate files exist. Please remove or set the configuration to thirdparty and delete certificate files using \"pkiremove\" before upgrading."
+CHECK_LDAP_CONFIGURED_OVER_IPv6="Downgrade is not allowed because IPv6 configuration for LDAP is in use. Please remove all the IPv6 configuration for LDAP using \"aaaconfig --remove\" before downgrading."
+UNSUPPORTED_IPFILTER_POLICY="Downgrade is not allowed because IPFILTER forwarding rule(s) is enabled. To Downgrade to lower version please delete the FORWARD rule(s) from IPFILTER policy"
+MARATHON_STRIKER_ERR_MSG="Firmware migration is not allowed since the FX8-24 and FR4-18i blades are both present.\nPlease remove the FR4-18i blades before proceeding with the firmwaredownload command."
+MARATHON_STRIKER_WARN_MSG="After the firmware migration has completed, the FR4-18i blade(s) needs to be removed if the FX8-24 blade(s) is to be plugged into the chassis."
+UNSUPPORTED_FLT_MON_CONFIGURED="Upgrade to 7.0 is not allowed because filter monitor is configured. Please enable frame monitor using \"fmconfig --show\" before upgrading."
+UNSUPPORTED_FLT_MON_CONFIG_6_3="Upgrade to 7.0 is not allowed because filter monitor is configured. Please remove the filter monitor related configurations using \"perfdelfiltermonitor\" and do \"perfcfgsave\". Frame monitor will be enabled from version 7.0"
+UNSUPPORTED_FWCONFIGURE1="Upgrade to 7.0 is not allowed because the threshold configuration changed alarm is set"
+UNSUPPORTED_FWCONFIGURE2="Similar configuration may exist for other classes and areas and on other FIDs. Please use \"fwconfigure\" to unset the same."
+UNSUPPORTED_CHECK_SECOND_TIMEBASE1="Upgrade is not allowed because timebase is configured as seconds"
+UNSUPPORTED_CHECK_SECOND_TIMEBASE2="Similar configurations may exist for other classes and areas and on other FIDs. Please Configure the timebase to other unit using \"fwconfigure/thconfig/portthconfig\" and upgrade."
+EUROPA_BLADE_POWER_ON_NOTE="Please power ON the FCoE10-24 (type 74) blades once switch is rebooted with new firmware and functionally up"
+UNSUPPORTED_EUROPA_POWER_ON_MSG="Non disruptive firmware download from v7.0 to v6.4.1_fcoe and vice versa is not allowed because one or more FCoE10-24 (type 74) blades are powered ON. Please use \"slotshow\" to find the slots in which these blades are and do poweroff using \"slotpoweroff\""
+UNSUPPORTED_TSTIMEZONE="Downgrade is not allowed because tstimezone is configured with three sections input. please change the configuration with two sections and proceed."
+VPWWN_CONFIGURED="Downgrade is not allowed because Fabric Assigned PWWN is configured in one or more partitions. Please delete all the Fabric Assigned PWWN configurations before downgrading."
+VE_XISL_CONFIGURED="Downgrade is not allowed, as VE XISL feature is in use. There may be LS having VE/GE/XGE ports and \"ALLOW XISL Use\" in that LS is turned on OR There may be \" ALLOW XISL Use\" turned on in one of LS and BS is having VE/GE port. Please move all VE/GE/XGE ports to DS and try downgrade again."
+UNSUPPORTED_RRDY_BASE_SWITCH="Upgrade to 7.0 is not allowed since base switch has R_RDY enabled ports. Please disable the R_RDY enabled ports in base switch using portcfgislmode command."
+UNSUPPORTED_IODDELAY_ON_UPGRADE="Upgrade to 7.0 is not allowed due to the presence of ioddelay configuration. Please reset the feature with \"ioddelayreset\" before upgrading to v7.0."
+FCFW_NOT_SUPPORTED="Upgrade to 7.0 is not allowed because FC Fastwrite is not supported on this version. Please use \"fastwritecfg\" to deconfigure FC Fastwrite for all slots and try again."
+BSTR_NOT_SUPPORTED="Upgrade to 7.0 is not allowed because TCP Byte Streaming is not supported on this version. Please use \"portcfg\" to deconfigure TCP Byte Streaming for all tunnels and try again."
+UNSUPPORTED_DUP_PORT_WWN="Upgrade to 7.0 or above is not allowed because duplicate PWWN devices are detected in one or more partitions. Please configure the devices with unique PWWNs or disable the ports and remove the devices with duplicate PWWNs before upgrading the firmware."
+SERDES_TUNE_ENABLED="Downgrade is not allowed because FC8-16 serdestunemode is enabled. Please use \"serdestunemode --show\" to view the mode and \"serdestunemode --reset\" to disable the feature before downgrading."
+ENHANCED_FC8_BLADE_IS_PRESENT="FC8-32E and FC8-48E are not supported by the targeted firmware. Please use slotshow to determine which of these are installed and remove them before continuing."
+UNSUPPORTED_DBR_ON_DOWNGRADE="Downgrade is not allowed because Device Based Routing is configured. Please use \"aptpolicy\" to change the routing policy."
+FC8_BLADE_IS_PRESENT="FC8-16, FC8-32 and FC8-48 are not supported by the targeted firmware. Please use slotshow to determine which of these are installed and remove them before continuing."
+D_PORT_R_RDY_NOT_SUPPORTED="Downgrade is not allowed because R-RDY flow control ports are configured as D-Ports. Please use \"portdporttest --show all\" to view the port list and \"portcfgdport --disable\" to disable before downgrading."
+D_PORT_DWDM_NOT_SUPPORTED="Downgrade is not allowed because D-Port is configured with DWDM mode. Please use \"portcfgshow\" to view the port list and \"portcfgdport --enable\" to reset DWDM mode before downgrading."
+###################################################
+###################################################
+####                                           ####
+####                                           ####
+####       PRESINSTALL CHECK SECTION           ####
+####    ------------------------------         ####
+####                                           ####
+###################################################
+###################################################
+
+
+correcthost() {
+	if [ $ACTIVECP ] ; then
+	"$@"
+	else
+	/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 "$@"
+	fi
+}
+
+#
+# both Active and Standby have the information of
+# VF and logical switches configured.
+#
+# VF case: on Standby CP, in order to login to each logical switch, 
+# we need to set CHASSIS_ROLEID FABOS_SWITCHNO CURRENT_VF in rsh.
+#
+correcthost_to_curr_vfid() {
+	if [ $ACTIVECP ] ; then
+		# for_all_context already did "context_switch --switch vfid"
+		"$@"
+	else
+		check_vf_enabled
+		if [ $? -eq $STS_OK ]; then
+			# VF disabled
+			/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 "$@"
+		else
+			# VF enabled, for_all_context changed glb_ls_id and glb_vf_id to each logical switch's
+			/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CHASSIS_ROLEID=0 FABOS_SWITCHNO=$glb_ls_id CURRENT_VF=$glb_vf_id CURRENT_AD=0 "$@"
+		fi
+	fi
+}
+
+# 7800/FX8-24
+# executes the provided function in the context of all configured virtual
+# fabrics, and logical switches on the active and standby CP's to determine
+# if a critera is met
+correcthost_all_vfs() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		# VF is enabled
+		if [ $ACTIVECP ] ; then
+			for_all_contexts correcthost_to_curr_vfid $@
+		else
+			# this is the standby cp, examine the configuration of the
+			# active cp
+			for_all_contexts_standby correcthost_to_curr_vfid $@
+		fi
+	else
+		correcthost_to_curr_vfid $@
+	fi
+	if [ $? -eq 0 ]; then
+		return $STS_OK
+	else
+		return $STS_ERR
+	fi
+}
+
+ficon_check_active()
+{
+     FICONCHECK=`/fabos/cliexec/configshow | grep -E "FICONTUNNEL" | wc -l`
+     if [ $FICONCHECK -eq 0 ]; then
+	     return $STS_OK
+     fi
+     return $STS_ERR
+}
+
+ficon_check_standby()
+{
+    FICONCHECK=`/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 /fabos/cliexec/configshow | grep -E "FICONTUNNEL" | wc -l`
+
+    if [ $FICONCHECK -eq 0 ]; then
+      	return $STS_OK
+    fi
+
+    return $STS_ERR
+}
+
+ficon_configured()
+{
+    if [ $ACTIVECP ]; then
+	ficon_check_active
+    else
+	ficon_check_standby
+    fi
+}
+
+#
+# chassisopt
+#
+# Retrieve the current chassisconfig option.
+#
+chassisopt() {
+	sed -n -e 's/^Cur.\+on: \([[:digit:]]\{1,\}\).*$/\1/gp'
+}
+
+#
+# marathon_present
+#
+# Check whether there are any marathon blades enabled in the system.
+#
+marathon_present() {
+
+	MARATHON=$(/fabos/cliexec/slotshow | grep " 24 " | wc -l)
+	return $MARATHON
+}
+
+#
+# ironman_present
+#
+# Check whether there are any ironman blades enabled in the system.
+#
+ironman_present() {
+
+	IRONMAN=$(/fabos/cliexec/slotshow | grep " 31 " | wc -l)
+	return $IRONMAN
+}
+
+#
+# positron_present
+#
+# Check whether there are any positron blades enabled in the system.
+#
+positron_present() {
+
+	POSITRON=$(/fabos/cliexec/slotshow | grep " 36 " | wc -l)
+	return $POSITRON
+}
+
+
+#
+# scimitar_present
+#
+# Check whether there are any marathon blades enabled in the system.
+#
+scimitar_present() {
+
+	SCIMITAR=$(/fabos/cliexec/slotshow | grep " 33 " | wc -l)
+	return $SCIMITAR
+}
+
+#
+# sabre_present
+#
+# Check whether there are any marathon blades enabled in the system.
+#
+sabre_present() {
+
+	SABRE=$(/fabos/cliexec/slotshow -d576 | grep " 38 " | wc -l)
+	return $SABRE
+}
+
+#
+# xenon_present
+#
+# Check whether there are any marathon blades enabled in the system.
+#
+xenon_present() {
+
+	XENON=$(/fabos/cliexec/slotshow | grep " 39 " | wc -l)
+	return $XENON
+}
+
+#
+# triton_present
+#
+# Check whether there are any zontron blades enabled in the system.
+#
+triton_present() {
+
+	TRITON=$(/fabos/cliexec/slotshow | grep " 51 " | wc -l)
+	return $TRITON
+}
+
+#
+# larissa_present
+#
+# Check whether there are any zontron blades enabled in the system.
+#
+larissa_present() {
+
+	LARISSA=$(/fabos/cliexec/slotshow | grep " 55 " | wc -l)
+	return $LARISSA
+}
+
+#
+# despina_present
+#
+# Check whether there are any zontron blades enabled in the system.
+#
+despina_present() {
+
+	DESPINA=$(/fabos/cliexec/slotshow | grep " 37 " | wc -l)
+	return $DESPINA
+}
+
+#
+# lance_present
+#
+# Check whether there are any lance blades enabled in the system.
+#
+lance_present() {
+
+	LANCE=$(/fabos/cliexec/slotshow | grep " 43 " | wc -l)
+	return $LANCE
+}
+
+#
+# mace_present
+#
+# Check whether there are any mace blades enabled in the system.
+#
+mace_present() {
+
+	MACE=$(/fabos/cliexec/slotshow -d576 | grep " 42 " | wc -l)
+	return $MACE
+}
+
+#
+# europa_present
+#
+# Check whether there are any europa blades enabled in the system.
+#
+europa_present() {
+
+	EUROPA=$(/fabos/cliexec/slotshow -d576 | grep " 74 " | wc -l)
+	return $EUROPA
+}
+
+#
+# striker_present
+#
+# Check whether there are any striker blades enabled in the system.
+#
+striker_present() {
+
+    STRIKER=$(/fabos/cliexec/slotshow -d576 | grep " 75 " | wc -l)
+    return $STRIKER
+}
+
+#
+# quattro_present
+#
+# Check whether there are any quattro blades enabled in the system.
+#
+quattro_present() {
+
+    QUATTRO=$(/fabos/cliexec/slotshow -d576 | grep " 77 " | wc -l)
+    return $QUATTRO
+}
+
+#
+# pluto_chassis
+#
+# Check whether there are any zontron blades enabled in the system.
+#
+pluto_chassis() {
+
+    	case ${SWBD##SWBD} in
+        '77')
+		return $STS_ERR
+		;;
+	*)
+	        return $STS_OK
+		;;
+	esac
+}
+
+
+#
+# Routing policy
+#
+# Check what routing policy it is.
+#
+routing_policy() {
+	/fabos/sbin/aptpolicy | sed -n -e 's/^ Cur.\+Policy: \([[:digit:]]\{1,\}\).*$/\1/gp'
+}
+
+#
+# portmirror_present
+#
+# Check whether there are any port mirror connections enabled in the system.
+# If there are not portmirror connections, portmirrorshow:
+# 	switch:root> portmirrorshow
+#	There are no port mirror connections configured
+#
+portmirror_present() {
+	CMD='s/^mirror\.portmirrorcnt:\([0-9]*\).*$/\1/p'
+	mrr_cnt=`PATH=/bin:/fabos/cliexec:/fabos/bin  configshow | sed -n -e "$CMD"`
+	return $mrr_cnt
+}
+
+# ag_persistent_alpa_enabled
+# Check is Persistent ALPA is enabled or not
+
+ag_persistent_alpa_enabled() {
+        ag_persistent_alpa=`/fabos/bin/ag --show | grep "Persistent ALPA" | grep -c "Enabled"`
+        return $ag_persistent_alpa
+}
+
+#
+# check_ag_staticfports
+# Check whether static F-ports configured or not
+#
+
+check_ag_staticfports() {
+
+ag_mode=`/fabos/bin/ag --modeshow | grep -c "NOT enabled"`
+if [ $ag_mode -eq 0 ]; then
+	num_nsfports=`/fabos/cliexec/configshow | grep "ag.port.nsfporttopo." | wc -l`
+	/fabos/cliexec/configshow | grep "ag.port.nsfporttopo." > /tmp/tmp_sfport.log
+
+	staticflag=0
+	nsfpt_pno=0
+	while [ "$nsfpt_pno" -lt "$num_nsfports" ]
+	do
+		keyisthere=0
+		keyisthere=`grep -wc "ag.port.nsfporttopo.$nsfpt_pno" /tmp/tmp_sfport.log`
+		if [ "$keyisthere" -eq "1" ]; then
+
+			left=`grep -w "ag.port.nsfporttopo.$nsfpt_pno" /tmp/tmp_sfport.log | cut -d : -f 2 |
+			cut -d , -f 1 | grep -c "0x00000000"`
+			right=`grep -w "ag.port.nsfporttopo.$nsfpt_pno" /tmp/tmp_sfport.log | cut -d : -f 2 |
+			cut -d , -f 2 | grep -c "0x00000000"`
+			other=`grep -wc "ag.port.nsfporttopo.$nsfpt_pno:0x0" /tmp/tmp_sfport.log`
+
+			if [ "$other" -eq "0" ]; then
+				
+				if [ "$left" -eq "0" -o "$right" -eq "0" ]; then
+					staticflag=1;
+					break;
+				fi
+
+			fi
+
+		fi
+		nsfpt_pno=`/usr/bin/expr $nsfpt_pno + 1`
+	done
+
+    /bin/rm -f /tmp/tmp_sfport.log
+
+	if [ "$staticflag" -eq "1" ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+fi
+
+}
+
+#
+# check_ag_eemon_installed
+# Check whether end to end monitors are installed in AG mode
+#
+
+check_ag_eemon_installed() {
+	
+    ag_mode=`/fabos/bin/ag --modeshow | grep -c "NOT enabled"`
+    if [ $ag_mode -eq 0 ]; then
+        eemon_count=`/fabos/link_bin/perfResourceShow --eeRes | grep "EEMON" | grep -c "[1-9]  |"`
+        if [ $eemon_count -eq 0 ]; then
+            return $STS_OK
+        else
+            return $STS_ERR
+        fi
+    fi
+}
+ 
+#
+# check_ag_fmon_installed
+# Check whether frame monitors are installed in AG mode
+#
+
+check_ag_fmon_installed() {
+	
+    ag_mode=`/fabos/bin/ag --modeshow | grep -c "NOT enabled"`
+    if [ $ag_mode -eq 0 ]; then
+        count=`/fabos/link_bin/fmMonitor --show -all | awk '{print $1}' | grep -c "[0-9]|"`
+        if [ $count -eq 0 ]; then
+            return $STS_OK
+        else
+            return $STS_ERR
+        fi
+    fi
+}
+
+#
+# check_enhanced_licenses_installed
+# Check whether any enhanced licenses are installed
+#
+
+check_enhanced_licenses_installed() {
+	
+    enh_licenses_installed=`/fabos/bin/licenseshow | grep -c "Feature name:"`
+    if [ $enh_licenses_installed -eq 0 ]; then
+        return $STS_OK
+    else
+        return $STS_ERR
+    fi
+}
+
+#
+# ag_persistent_pid_enabled
+# Check whether Persistent PID is enabled or not
+#
+ag_persistent_pid_enabled() {
+	ag_persistent_pid=`/fabos/bin/ag --show | grep "Persistent PID" | grep -c "Enabled"`
+	return $ag_persistent_pid
+}
+#
+# ag_wwnbal_policy_enabled
+# Check whether WWN balancing policy is enabled or not
+#
+ag_wwnbal_policy_enabled() {
+	ag_wwnbal_policy=`/fabos/bin/ag --policyshow | grep "wwnloadbalance" | grep -c "Enabled"`
+	return $ag_wwnbal_policy
+}
+
+#
+# ag_wwn_staticmap_enabled
+# Check whether WWN Static mappings are enabled
+#
+ag_wwn_staticmap_enabled() {
+	ag_wwn_staticmap=`/fabos/bin/ag --show | grep "Static WWN Map" | grep -c "Configured"`
+	return $ag_wwn_staticmap
+}
+
+#
+# ag_mode_enabled
+#
+# Check whether the switch is currently in AG mode
+#
+# JOE
+ag_mode_enabled() {
+
+	ag_mode=`/fabos/link_bin/switchshow | grep -c "Access Gateway Mode"`
+	return $ag_mode
+
+}
+
+#
+# check_ipfilter_forward_rule
+#
+# Check whether IPFILTER FORWARD rule is configured
+#
+check_ipfilter_forward_rule() {
+	ip_forward=`/fabos/abin/ipfilter --show -a | grep -c "FWD"`
+	
+	if [ $ip_forward -gt 1 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+#
+# ads_policy_enabled
+#
+# Check whether ADS policy of the AG is enabled
+#
+ads_policy_enabled() {
+	/fabos/bin/ag --policyshow | grep ads | grep Enabled > /dev/null 2>&1
+	rc=$?
+	if [ $rc -eq 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+
+pid_format_two() {
+	#
+	# Block upgrade if PID format is set to 2
+	#
+	pid_format=`/fabos/cliexec/configshow | grep pidFormat | cut -f 2 -d ':'`
+	if [ $pid_format -eq 2 ]; then
+	    return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+perf_mon_check() {
+
+	# Run this check only on C2 and GEYE2 family of platforms.
+	case ${SWBD##SWBD} in
+		'71'|'62'|'66'|'64'|'77'|'42'|'72'|'73'|'75'|'67')
+		#
+		# Block upgrade if TT monitor are installed
+		#
+		/fabos/cliexec/configshow | grep "ttmonc" > /dev/null 2>&1
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			check_fcr_enabled
+			if [ $? -ne $STS_OK ]; then
+				return $STS_ERR
+			fi
+		fi
+		;;
+	*)
+		return $STS_OK
+		;;
+	esac
+
+	return $STS_OK
+}
+
+# Check if certificate is installed.
+# Presence of non-zero length files under /etc/fabos/certs/sw0 directory
+# implies certificate is installed on the switch.
+
+check_nz_cert() {
+   shopt -s nullglob
+   for i in /etc/fabos/certs/sw0/*
+   do
+      [ ! -z "$i" ] && return 0
+   done
+      return 1
+}
+
+check_http_enabled() {
+    F=/etc/fabos/fabos.0.conf
+
+    #
+    # If http.enabled is set to 1, return OK.
+    #
+    grep -q '^http\.enabled:1' $F  && return $STS_OK
+
+    #
+    # if certs are  not installed (chck_nz_cert == 1)
+    # return error.
+    #
+    check_nz_cert || return $STS_ERR
+
+    #
+    # if certs are  installed but http.ssl.enabled is set to 0
+    # return error.
+    #
+    grep -q '^http\.ssl\.enabled:0' $F && return $STS_ERR
+    return $STS_OK
+}
+
+
+check_trunkarea_configured() {
+
+    case $(correcthost /fabos/sbin/porttrunkarea --show enabled 2>&1) in
+	("No ports have Trunk Area enabled") return $STS_OK;;
+	("Error: This command is not supported in AG mode") return $STS_OK;;
+	(*"No such file or directory") return $STS_OK;;
+	(*) return $STS_ERR;;
+	esac
+}
+
+#
+# check if any TI over FCR zones are configured.
+# i.e. look for a -1 or WWN in zone --show output.
+# define local variable dd == 2 hex digits for ease of readability
+# of the case pattern
+#
+check_ti_over_fcr_zone_configured() {
+	local dd='[0-9a-fA-F][0-9a-fA-F]'
+	local v=$(correcthost /fabos/cliexec/zone --show 2>/${NULL})
+    case "$v" in
+	(*$dd:$dd:$dd:$dd:$dd:$dd:$dd:$dd*) return $STS_ERR;;
+	(*-1*) return $STS_ERR;;
+	(*) return $STS_OK;;
+	esac
+}
+
+#
+# check for Frame Redirect zones configured
+# along with Interopmode 2.
+#
+check_for_rd_zones_with_mode_2_configured() {
+
+	# first check interop
+
+	local tmp_mode=`correcthost /fabos/cliexec/configshow | grep switch.interopMode`
+	local im_mode=${tmp_mode//[^0-9]}
+
+	tmp_mode=`correcthost /fabos/cliexec/configshow | grep switch.mcdtFabricMode`
+	local mcdt_mode=${tmp_mode//[^0-9]}
+
+	if [ "$im_mode" == "0" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 2
+	else
+		return $STS_OK
+	fi
+
+	# check for frame redirect zones
+
+	if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_0917; then
+		return $STS_ERR
+	fi
+
+        if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_1109; then
+		return $STS_ERR
+	fi
+
+
+	if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_______base; then
+		return $STS_ERR
+	fi
+
+        return $STS_OK
+}
+
+#
+# check for Frame Redirect zones configured
+# along with Interopmode 3.
+#
+check_for_rd_zones_with_mode_3_configured() {
+
+	# first check interop
+
+	local tmp_mode=`correcthost /fabos/cliexec/configshow | grep switch.interopMode`
+	local im_mode=${tmp_mode//[^0-9]}
+
+	tmp_mode=`correcthost /fabos/cliexec/configshow | grep switch.mcdtFabricMode`
+	local mcdt_mode=${tmp_mode//[^0-9]}
+
+	if [ "$im_mode" == "1" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 3
+	else
+		return $STS_OK
+	fi
+
+	# check for frame redirect zones
+
+	if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_0917; then
+		return $STS_ERR
+	fi
+
+        if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_1109; then
+		return $STS_ERR
+	fi
+
+
+	if correcthost /fabos/cliexec/cfgshow | grep -q zone.*red_______base; then
+		return $STS_ERR
+	fi
+
+        return $STS_OK
+}
+#
+# if upgrading to 6.3 make sure that
+# no zones or configs are named with the msfr prefix
+#
+check_for_msfr_zone_names() {
+
+
+
+	# check for msfr zone and config names
+	# return good if both the zone name and config name are found
+	# this is to protect agenst a Downgrade upgrade action where msfr zones
+	# could be valid.  This will only throw an error if the zone name or the
+	# config name match the msfr header but not both.
+
+	if correcthost /fabos/cliexec/cfgshow | grep -q msfr_zn_; then
+		if correcthost /fabos/cliexec/cfgshow | grep -q msfr_cfg_; then
+			return $STS_OK
+		else
+			return $STS_ERR
+		fi
+	fi
+	if correcthost /fabos/cliexec/cfgshow | grep -q msfr_cfg_; then
+			return $STS_ERR
+	fi
+
+        return $STS_OK
+}
+
+#
+# check_did_offset_with_im_enabled
+# This checks whether the domain ID offset is configured with default offset mode
+# or not with Interopmode enabled(McData mode and Open Mcdata mode)
+#
+check_did_offset_with_im_enabled() {
+
+	# first check interop
+
+	local tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.interopMode`
+	local im_mode=${tmp_mode//[^0-9]}
+
+	tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.mcdtFabricMode`
+	local mcdt_mode=${tmp_mode//[^0-9]}
+
+	if [ "$im_mode" == "0" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 2
+	elif [ "$im_mode" == "1" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 3
+	else
+		return $STS_OK
+	fi
+
+	# Check the domain ID offset
+	tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.domain_id_offset`
+	did_offset=${tmp_mode//[^0-9]}
+
+	if [ "$did_offset" == "96" ]; then
+		return $STS_OK
+	fi
+
+	return $STS_ERR
+
+}
+
+#
+# check_hif_with_im_enabled
+# This checks whether the HIF is configured in interopmode
+# (McData mode and Open Mcdata mode)
+#
+check_hif_with_im_enabled() {
+
+	# first check interop
+	local tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.interopMode`
+	local im_mode=${tmp_mode//[^0-9]}
+
+	tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.mcdtFabricMode`
+	local mcdt_mode=${tmp_mode//[^0-9]}
+
+	if [ "$im_mode" == "0" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 2
+	elif [ "$im_mode" == "1" ] && [ "$mcdt_mode" == "1" ]; then
+		$ECHO mode 3
+	else
+		return $STS_OK
+	fi
+
+
+	tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep fabric.hifmode`
+	hif_mode=${tmp_mode//[^0-9]}
+
+	if [ "$hif_mode" == "0" ]; then
+		return $STS_OK
+	fi
+
+
+	return $STS_ERR
+
+}
+
+im2_mode=" "
+im3_mode=" "
+im2_enable=0
+im3_enable=0
+check_interop_support() {
+	# first check interop
+	local tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.interopMode`
+	local im_mode=${tmp_mode//[^0-9]}
+
+	tmp_mode=`correcthost_to_curr_vfid /fabos/cliexec/configshow | grep switch.mcdtFabricMode`
+	local mcdt_mode=${tmp_mode//[^0-9]}
+
+	if [ "$im_mode" == "0" ] && [ "$mcdt_mode" == "1" ]; then
+		im2_enable=1
+		if [ "$im2_mode" == " " ]; then
+			im2_mode="$im2_mode $CURRENT_VF"
+		else
+			im2_mode="$im2_mode, $CURRENT_VF"
+		fi
+	elif [ "$im_mode" == "1" ] && [ "$mcdt_mode" == "1" ]; then
+		im3_enable=1
+		if [ "$im3_mode" == " " ]; then
+			im3_mode="$im3_mode $CURRENT_VF"
+		else
+			im3_mode="$im3_mode, $CURRENT_VF"
+		fi
+	fi
+}
+
+check_interop_in_contexts() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts check_interop_support
+	else
+		check_interop_support
+	fi
+
+	if [ "$im2_enable" == "1" ]; then
+		add_err_status " * WARNING!!! McDATA Fabric mode(IM2) is enabled on the following FID(s)$im2_mode."
+	fi
+
+	if [ "$im3_enable" == "1" ]; then
+		add_err_status " * WARNING!!! McDATA Open Fabric mode(IM3) is enabled on the following FID(s)$im3_mode."
+	fi
+
+	if [ "$im2_enable" == "1" ] || [ "$im3_enable" == "1" ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+#
+#
+#   If any threshold for change is configured, do not allow
+#	If any changed configurations are present, 
+#	check whether the value is greater than 0
+#
+check_fwconfigure_change()
+{
+	change_conf_count=$(correcthost_to_curr_vfid /fabos/cliexec/configshow | 
+		grep thresh.cust | grep changed | wc -l)
+	if [ $change_conf_count -gt 0 ]; then
+		correcthost_to_curr_vfid /fabos/cliexec/configshow | grep thresh.cust | 
+		grep "changed" | 
+		while read line 
+		do 
+			if [ $(echo $line | cut -d: -f2) -gt 0 ]; then
+				class=`echo $line | cut -d "." -f3`
+				area=`echo $line | cut -d "." -f4`
+				add_err_status "$UNSUPPORTED_FWCONFIGURE1 for class $class,	area $area on FID $CURRENT_VF."
+				return $STS_ERR
+			else
+				continue
+			fi
+		done
+	fi
+}
+#
+#   Check for mulitiple switches including logical switches
+#
+check_multi_fwconfigure_change() {
+
+    check_vf_enabled
+
+    if [ $? -ne $STS_OK ]; then
+		if [ $ACTIVECP ] ; then
+		        for_all_contexts check_fwconfigure_change
+		else
+			for_all_contexts_standby check_fwconfigure_change
+		fi
+    else
+        check_fwconfigure_change
+    fi
+}
+
+#
+#  Allow downgrade if the encryption feature versioning  maj.min <  downgrade maj.min
+#
+
+check_feature_enabled()
+{
+    feature=$1
+    if [ `/fabos/cliexec/configshow | grep "$feature" |wc -l` -gt 0 ]; then
+        state=`/fabos/cliexec/configshow | grep "$feature" | cut -d ":" -f2`
+        if [ $state == "Disabled" ]
+        then
+            return $STS_OK
+        else
+            return $STS_ERR
+        fi
+    else
+        return $STS_OK
+    fi
+}
+
+check_feature_decommisison()
+{
+	ENC_LANCE=$(/fabos/cliexec/slotshow | grep " 43 " | wc -l)
+	ENC_MACE=$(/fabos/cliexec/slotshow -d576 | grep " 42 " | wc -l)
+	if [ "x$TYPE" != "xrestore" ]; then
+		if [ 1 -eq $ENC_MACE -o 0 -ne $ENC_LANCE ]
+		then
+    		check_feature_enabled "cryptoDev.swEncFeatureMode.decommission"
+			if [ $? -ne 0 ]
+			then
+				return $STS_ERR
+			fi
+		fi
+	fi
+    return $STS_OK
+}
+
+check_feature_disk_tape_coexistence()
+{
+	ENC_LANCE=$(/fabos/cliexec/slotshow | grep " 43 " | wc -l)
+	ENC_MACE=$(/fabos/cliexec/slotshow -d576 | grep " 42 " | wc -l)
+	if [ "x$TYPE" != "xrestore" ]; then
+		if [ 1 -eq $ENC_MACE -o 0 -ne $ENC_LANCE ]
+		then
+    		check_feature_enabled "cryptoDev.swEncFeatureMode.diskTapeCoExistence"
+			if [ $? -ne 0 ]
+			then
+				return $STS_ERR
+			fi
+		fi
+	fi
+    return $STS_OK
+}
+
+check_feature_replication()
+{
+	ENC_LANCE=$(/fabos/cliexec/slotshow | grep " 43 " | wc -l)
+	ENC_MACE=$(/fabos/cliexec/slotshow -d576 | grep " 42 " | wc -l)
+	if [ "x$TYPE" != "xrestore" ]; then
+		if [ 1 -eq $ENC_MACE -o 0 -ne $ENC_LANCE ]
+		then
+			check_feature_enabled "cryptoDev.swEncFeatureMode.repl"
+			if [ $? -ne 0 ]
+			then
+				return $STS_ERR
+			fi
+		fi
+	fi
+    return $STS_OK
+}
+
+check_feature_tklm()
+{
+	ENC_LANCE=$(/fabos/cliexec/slotshow | grep " 43 " | wc -l)
+	ENC_MACE=$(/fabos/cliexec/slotshow -d576 | grep " 42 " | wc -l)
+	if [ "x$TYPE" != "xrestore" ]; then
+		if [ 1 -eq $ENC_MACE -o 0 -ne $ENC_LANCE ]
+		then
+			check_feature_enabled "cryptoDev.swEncFeatureMode.tklm"
+			if [ $? -ne 0 ]
+			then
+				return $STS_ERR
+			fi
+		fi
+	fi
+	return $STS_OK
+}
+
+check_default_did_offset_in_im() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_did_offset_with_im_enabled
+	else
+		check_did_offset_with_im_enabled
+	fi
+}
+
+check_hif_mode_in_im() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_hif_with_im_enabled
+	else
+		check_hif_with_im_enabled
+	fi
+}
+
+#
+#   Check if portfencing bit is set for State Change
+#   for all instance of switches.
+#
+check_pf_statechange_set() {
+
+	PORTPFBIT=`/fabos/cliexec/configshow  | grep thresh | grep port.State | grep -E  '[^0-9][3-6][0-9]'| grep -v -E '[^0-9]3[0-1]' | wc -l`
+
+	if [ $PORTPFBIT -gt 0 ]; then
+	   return $STS_ERR
+	else
+	   return $STS_OK
+	fi
+}
+
+check_pf_statechange_set_allinstances() {
+
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+	   for_all_contexts check_pf_statechange_set
+	else
+	   check_pf_statechange_set
+	fi
+}
+
+check_multiple_email_address_set_FW_alert() {
+
+	MULTI_EMAIL=`/fabos/cliexec/configshow  | grep multi_rcpt | grep item_112 | grep -E  ','| wc -l`
+
+	if [ $MULTI_EMAIL -gt 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+check_multi_email_set_allinstances() {
+
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_multiple_email_address_set_FW_alert
+	else
+		check_multiple_email_address_set_FW_alert
+	fi
+}
+
+check_tstimezone_with_three_sections() {
+
+	key=`/fabos/bin/configshow -a | grep ts.tz`
+	value=`echo $key | grep ts.tz | cut -f 2 -d ':'`
+	no_fields=`echo $value |awk -F'/' '{print NF}'`
+	no_fields=`expr $no_fields - 1`
+
+	if [ $no_fields -eq 2 ]; then
+                return $STS_ERR
+        else
+                return $STS_OK
+        fi
+}
+
+check_tstimezone_with_three_sections_allinstances() {
+
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_tstimezone_with_three_sections
+	else
+		check_tstimezone_with_three_sections
+	fi
+}
+
+check_for_vpwwns_configuration() {
+	case ${SWBD##SWBD} in
+        '62'|'77'|'109'|'71'|'66'|'64'|'92')
+		context_switch chassis
+		total_vpwwns=`/fabos/cliexec/fapwwn --show -totalcount | cut -d ' ' -f 6`
+		if [ $total_vpwwns -gt 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+        ;;
+    	*)
+        return $STS_OK
+        ;;
+    esac
+}
+
+#check if zone size greater than 1MB
+check_max_zone_size() {
+	size=`/fabos/cliexec/cfgsize | grep committed | cut -d ' ' -f 10`
+	if [ $size -gt 1045274 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+#check if zone size greater than 1MB in all contexts
+check_max_zone_size_in_contexts() {
+    check_vf_enabled
+    if [ $? -ne $STS_OK ]; then
+        CHASSISCMD="cmd_chassis"
+        for_all_contexts check_max_zone_size
+    else
+        check_max_zone_size
+    fi
+}
+
+#check if rrdy is enabled in base switch
+check_rrdy_base_switch () {
+	BASE=`/fabos/bin/switchshow | grep "Base Switch:" | cut -d ' ' -f 6 | cut -d ',' -f 1`
+
+	if [ "$BASE" == "Yes" ]; then
+		PORTCFG=`/fabos/link_bin/portcfgshow | grep "ISL R_RDY Mode" | grep "ON" | wc -l`
+
+		if [ $PORTCFG -gt 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+		return $STS_OK
+	fi
+}
+
+#check if rrdy enabled in all contexts
+check_rrdy_mode_in_contexts() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts check_rrdy_base_switch
+	else
+		return $STS_OK
+	fi
+}
+
+#
+#
+# credit_recovery_check_active
+# This checks the active CP for any credit recovery active ports.
+#
+credit_recovery_check_active() {
+	string=`/fabos/cliexec/islshow | grep -c "CR_RECOV"`
+	return $string
+}
+
+#
+# credit_recovery_check_standby
+# This is run for stand by CP. Run rsh to check from active CP for credit recovery ports.
+#
+credit_recovery_check_standby() {
+	string=`/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 /fabos/cliexec/islshow | grep -c "CR_RECOV"`
+	return $string
+}
+
+#
+# credit_recovery_enabled
+#
+# Check if credit recovery is enabled on any local ports. If it is
+# configured we fail the firmware downgrade cases.
+#
+credit_recovery_enabled() {
+
+    if [ $ACTIVECP ]; then
+	credit_recovery_check_active
+    else
+	credit_recovery_check_standby
+    fi
+}
+
+#
+# check_ag_trunk_configured
+#
+# Check whether any of N_Port trunks are enabled or not
+#
+check_ag_trunk_configured() {
+	if [ -f "/etc/fabos/ag_platform.0" ]; then
+		/fabos/bin/switchshow | grep -c Trunk > /dev/null 2>&1
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+	    return $STS_OK
+	fi
+}
+
+#
+# 7500e
+# Check if 7500e is present
+#
+is7500e_present()
+{
+	IS7500ECHECK=`/fabos/link_bin/chassisshow | grep -c "7500E"`
+
+	return $IS7500ECHECK
+}
+
+#
+# 7500e
+# Check if active FC ports exceeded
+#
+maxfcports_exceeded()
+{
+	# for ports 2 through 15
+	for i in `seq 2 15`; do
+		# look at the 4th nibble in flags
+		FCPORTCHECK=`/fabos/cliexec/configshow | grep portCfg: | grep -v lsportCfg | cut -d : -f 2 | cut -d \; -f $(($i + 1)) | cut -d , -f 2 | tail -c 5 | cut -c 1`
+		FCLSPORTCHECK=`/fabos/cliexec/configshow | grep lsportCfg: | cut -d : -f 2 | cut -d \; -f $(($i + 1)) | cut -d , -f 2 | tail -c 5 | cut -c 1`
+		# if 8 or higher (check in asci mode to allow for hex values)
+		if [ ! "$FCPORTCHECK" \> "7" ]; then
+			if [ ! "$FCLSPORTCHECK" \> "7" ]; then
+				return $STS_ERR
+			fi
+		fi
+	done
+	return $STS_OK
+}
+
+#
+# 7500e
+# Check if number of FCIP tunnels exceeded
+#
+maxtunnels_exceeded()
+{
+    NUMBERTUNNELS0=`/fabos/cliexec/configshow | grep -c "P0.FCIPTUNNEL"`
+    NUMBERTUNNELS1=`/fabos/cliexec/configshow | grep -c "P1.FCIPTUNNEL"`
+
+    if [ $NUMBERTUNNELS0 -le 1 ] && [ $NUMBERTUNNELS1 -le 1 ]; then
+        return $STS_OK
+    fi
+    return $STS_ERR
+}
+
+#
+# 7500e
+# Check if bandwidth exceeded on any FCIP tunnels
+#
+bandwidth_exceeded()
+{
+    NUMBERTUNNELS0=`/fabos/cliexec/configshow | grep -c "P0.FCIPTUNNEL"`
+    NUMBERTUNNELS1=`/fabos/cliexec/configshow | grep -c "P1.FCIPTUNNEL"`
+    BANDWIDTHCHECK0=`/fabos/cliexec/configshow | grep "P0.FCIPTUNNEL" | sed -n -e 's/.*CommRt=//' -e '1 s/,.*//p'`
+    BANDWIDTHCHECK1=`/fabos/cliexec/configshow | grep "P1.FCIPTUNNEL" | sed -n -e 's/.*CommRt=//' -e '1 s/,.*//p'`
+
+    # Check the first tunnel for port 0. If more than one tunnel the
+    # maxtunnels_exceeded() will fail
+    if [ $NUMBERTUNNELS0 -gt 0 ]; then
+        if [ $BANDWIDTHCHECK0 -ge 1400 ] && [ $BANDWIDTHCHECK0 -le 50000 ]; then
+            RET0=$STS_OK
+        else
+            RET0=$STS_ERR
+        fi
+    else
+        RET0=$STS_OK
+    fi
+
+    # Check the first tunnel for port 1. If more than one tunnel the
+    # maxtunnels_exceeded() will fail
+    if [ $NUMBERTUNNELS1 -gt 0 ]; then
+        if [ $BANDWIDTHCHECK1 -ge 1400 ] && [ $BANDWIDTHCHECK1 -le 50000 ]; then
+            RET1=$STS_OK
+        else
+            RET1=$STS_ERR
+        fi
+    else
+        RET1=$STS_OK
+    fi
+
+    if [ $RET0 -eq $STS_OK ] && [ $RET1 -eq $STS_OK ]; then
+        return $STS_OK
+    fi
+    return $STS_ERR
+}
+
+#
+# 7500e
+# Check if TapePipelining enabled
+#
+tapepipe_configured()
+{
+    TAPEPIPECHECK=`/fabos/cliexec/configshow | grep -c "TapeAcc=1"`
+
+    if [ $TAPEPIPECHECK -eq 0 ]; then
+        return $STS_OK
+    fi
+    return $STS_ERR
+}
+
+#
+# 7500e
+# Check if IPSec enabled
+#
+ipsec_configured()
+{
+    IPSECCHECK=`/fabos/cliexec/configshow | grep -c "IPSEC=[^0]"`
+
+    if [ $IPSECCHECK -eq 0 ]; then
+        return $STS_OK
+    fi
+    return $STS_ERR
+}
+
+#
+# FCFW
+# Check if FC Fastwrite enabled
+#
+fcfw_configured()
+{
+	FCFWCHECK=`correcthost_all_vfs /fabos/cliexec/configshow | grep -c "portCfg.*FCFW"`
+
+	if [ $FCFWCHECK -gt 0 ]; then
+      echo -e "`correcthost_all_vfs /fabos/cliexec/configshow | grep FCFW | sed -e 's/portCfg.S/Slot /' -e 's/.P/ Port GE/' -e 's/.MODE:/ mode is /'`\n"
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+#
+# BSTR
+# Check if TCP Byte Streaming enabled
+#
+bstr_configured()
+{
+	BSTRCHECK=`correcthost_all_vfs /fabos/cliexec/configshow | grep -c "TcpStr=1"`
+
+	if [ $BSTRCHECK -gt 0 ]; then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+#
+# FCoE Provision warning message.
+#
+fcoe_provision_warn_msg()
+{
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		echo -e $FCOE_PROVISION_CONFIG_MSG
+	fi
+	return $STS_OK
+}
+
+#
+# 7500e
+# Check if configured for a 7500e and if so, validate the configuration
+# of the FCIP tunnels.
+#
+check_7500e_configuration()
+{
+	$ECHO check_7500e_configuration
+
+	# 7500 must be active cp. If not, then chassis can't be a 7500e
+	is7500e_present
+	if [ $? -eq 1 ]; then
+		ISUPGRADELICENSECHECK=`/fabos/cliexec/licenseshow | grep -c "7500E Upgrade license"`
+		if [ $ISUPGRADELICENSECHECK -eq 0 ]; then
+			TEST maxfcports_exceeded "$MAXFCPORTSEXCEEDED_7500EMSG"
+
+			TEST maxtunnels_exceeded "$MAXTUNNELEXCEEDED_7500EMSG"
+
+			TEST bandwidth_exceeded "$MAXBANDWIDTHEXCEEDED_7500EMSG"
+
+			TEST tapepipe_configured "$FCIPTAPEACC_7500EMSG"
+
+			TEST ipsec_configured "$FCIPIPSEC_7500EMSG"
+
+			TEST ficon_configured "$FCIPFICON_7500EMSG"
+		fi
+	else
+		return $STS_OK
+	fi
+	return $RET_CODE
+}
+
+#
+# 7800/FX8-24
+# Check is any FCIP restrictions are exceeded.
+#
+check_xfcip_features()
+{
+    ret=$STS_OK
+
+    # Make special note of FCOE build as this has new FCIP features
+    if [ -z $TYPE ]; then
+        /bin/cat /tmp/release.plist  2> /dev/null | grep -i "6.4.1_fcoe"  > ${NULL} 2>&1
+    else
+        /bin/cat /mnt/fabos/share/release  2> /dev/null | grep -i "6.4.1_fcoe" > ${NULL} 2>&1
+    fi
+    if [ $? -eq 0 ]; then
+		FCOE="_fcoe"
+    else
+		FCOE=""
+    fi
+
+	ACTIVE_MAJOR=`correcthost_to_curr_vfid /sbin/getfabosver | sed -n -e 's/Major://gp'`
+	if [ $ACTIVE_MAJOR -ge 7 ]; then
+		case ${SWBD##SWBD} in
+			'62' | '77' | '83')
+				if correcthost_all_vfs /fabos/link_bin/portShow fciptunnel all --validate ${TO_MAJOR}.${TO_MINOR}.${TO_PATCH}${FCOE} | grep . >> $STATUS_FILE; then
+					ret=$STS_ERR
+				fi
+				if correcthost_all_vfs /fabos/link_bin/portShow ipif all --validate ${TO_MAJOR}.${TO_MINOR}.${TO_PATCH}${FCOE} | grep . >> $STATUS_FILE; then
+					ret=$STS_ERR
+				fi
+			;;
+			*)
+				ret=$STS_OK
+			;;
+		esac
+	else
+		ret=$STS_OK
+	fi
+
+    return $ret
+}
+
+#
+# 7800/FX8-24
+# Check if inband management is configured
+#
+check_xfcip_inband_configured()
+{
+	if correcthost_all_vfs /fabos/cliexec/configshow | grep -q "XMGMTIF"; then
+		return $STS_ERR
+	fi
+	if correcthost_all_vfs /fabos/cliexec/configshow | grep -q "XMGMTRTE"; then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+#
+# On the active CP, check for the presence of Mirror port in
+# Switchshow and also check the config database for mirrorresource
+# Count. Block the downgrade even if one of them is active.
+#
+check_c2_mirror_on_active() {
+
+    CHASSISCMD="cmd_chassis"
+	COUNTER=1
+	FID=0
+	mirror_port=0
+
+#	NON-VF CASE
+
+	num_status=0
+
+	/fabos/bin/fosconfig --show | grep "Virtual Fabric" | grep enabled > /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		num_mirror_cnt_configshow=`/fabos/cliexec/configshow  | grep -i portmirrorcnt | grep "1\|2\|3\|4" | cut -d ":" -f2 | wc -l`
+	 	num_mirror_conn=`/fabos/bin/switchshow | grep -i "Mirror Port" | wc -l`
+		num_status=`/usr/bin/expr $num_mirror_cnt_configshow + $num_mirror_conn`
+
+		if [ "$num_status" -eq  0 ] ; then
+			return $STS_OK
+		else
+			return $STS_ERR
+		fi
+	fi
+
+#	VF CASE
+	mirror_cnt=`$CHASSISCMD /fabos/cliexec/configshow -all | grep -i "portmirrorcnt" | grep "1\|2\|3\|4" | cut -d ":" -f2 | wc -l`
+
+	if [ $mirror_cnt -ne 0 ]; then
+		return $STS_ERR
+	fi
+
+	# This should use "for_all_contexts" in the future
+	COUNT=`$CHASSISCMD /fabos/cliexec/configshow -all | grep -i "Fabric ID" | cut -d "=" -f2 | wc -l`
+
+	while [ "$COUNTER" -le "$COUNT" ]
+	do
+		FID=`$CHASSISCMD /fabos/cliexec/configshow -all | grep -i "Fabric ID" | cut -d "=" -f2  | head -$COUNTER | tail -1`
+		COUNTER=`/usr/bin/expr $COUNTER + 1`
+		context_switch $FID
+	  	mirror_port=`/fabos/bin/switchshow | grep -i "Mirror Port" | wc -l`
+		if [ "$mirror_port" -ne 0 ]; then
+			return $STS_ERR
+		fi
+	done
+	return $STS_OK
+
+}
+
+#
+# Check if port mirroring feature is being used currently in
+# Neptune, Thor, Spirit and THawk. If so, downgrade has to be
+# blocked.
+#
+check_c2_mirror_connection() {
+
+	# Run this check only on C2 family of platforms.
+	case ${SWBD##SWBD} in
+		'71' | '62' | '66' | '64' | '77' | '92')
+		if [ $ACTIVECP ]; then
+			check_c2_mirror_on_active
+#		else
+    #On a Standby ASIC is not attached. Reading the proc switch/*/info makes call to the ASIC driver.
+    #As the ASIC object is not attached on the Standby, the ioctl fails and ASIC logs message C2-5824 to Raslog.
+    #This continuous streaming of message eventually triggers FFDC.
+    #Avoiding reading this proc on Standby and working on way to get the mirror information.
+#			check_c2_mirror_on_standby
+		fi
+		;;
+	*)
+		return $STS_OK
+		;;
+	esac
+}
+
+#
+# Check if Switch is a Spirit and currenly in AG mode.
+# If so, downgrade has to be blocked, because AG mode
+# on a Spirit is not supported before 6.2.
+# And the same would apply to Gladius.
+#
+# JOE
+check_ag_mode_enabled() {
+
+	case ${SWBD##SWBD} in
+        '66' | '92')
+		ag_mode_enabled
+		;;
+	*)
+		return $STS_OK
+		;;
+	esac
+}
+
+#
+# Check if Switch is a Mace and currenly in AG mode.
+# If so, downgrade has to be blocked, because AG mode
+# on a Mace is not supported before 6.3.
+#
+check_mace_ag_mode_enabled() {
+
+	case ${SWBD##SWBD} in
+        '67')
+		ag_mode_enabled
+		;;
+	*)
+		return $STS_OK
+		;;
+	esac
+}
+
+#
+# Check if Switch is an Elara and currenly in AG mode.
+# If so, downgrade has to be blocked, because AG mode
+# on a Elara is not supported before 6.3.
+#
+check_elara_ag_mode_enabled() {
+
+    case ${SWBD##SWBD} in
+        '76')
+        ag_mode_enabled
+        ;;
+    *)
+        return $STS_OK
+        ;;
+    esac
+}
+
+#
+# check_ag_qos_port_active
+#
+# Check whether any port is active on QoS
+#
+check_ag_qos_port_active() {
+	if [ -f "/etc/fabos/ag_platform.0" ]; then
+		/fabos/bin/switchshow | grep -c AoQ > /dev/null 2>&1
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+	    return $STS_OK
+	fi
+}
+
+#
+# vf_enabled
+#
+# Check whether VF is enabled
+# both Active and Standby have this information
+#
+check_vf_enabled() {
+	/fabos/bin/fosconfig --show | grep "Virtual Fabric" | grep enabled > /dev/null 2>&1
+
+	if [ $? -eq 0 ]; then
+        return $STS_ERR
+    else
+        return $STS_OK
+    fi
+
+}
+
+#
+# check_qos_di_zones_presence{,_internal}
+#
+# Check whether QoS zone(s) are either in
+# defined or active configuration.
+#
+check_qos_di_zones_presence_internal() {
+
+	qos_di_exists=`/fabos/libexec/chkSpecialZoneTypeExists qosdi | grep "exists" | wc -l`
+
+	if [ $qos_di_exists -ne 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+check_qos_di_zones_presence(){
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_qos_di_zones_presence_internal
+	else
+		check_qos_di_zones_presence_internal
+	fi
+}
+
+#
+# check_etiz_presence_internal{,_internal}
+#
+# Check whether Enhanced TI zone(s) are defined
+#
+check_etiz_presence_internal() {
+
+	etiz_exists=`/fabos/libexec/chkSpecialZoneTypeExists etiz | grep "exists" | wc -l`
+
+	if [ $etiz_exists -ne 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+check_etiz_zones_presence(){
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_etiz_presence_internal
+	else
+		check_etiz_presence_internal
+	fi
+    if [ $? -eq 0 ]; then
+      	return $STS_OK
+	else
+		return $STS_ERR
+	fi
+}
+
+#
+# Check from fabric side if the F port to
+# which AG is connected is active on QoS .
+# If so, then block downgrade
+#
+check_ag_qos_port_active_fabric_side() {
+	hashow_cmd=$(ls /fabos/cliexec/hashow)
+	if [ "$hashow_cmd" != "/fabos/cliexec/hashow" ]; then
+	hashow_cmd="/fabos/bin/hashow"
+	fi
+
+	case "$($hashow_cmd | ( read a; echo $a ))" in
+		*Local*Active*)
+		grep -q -s AOQ_AG /proc/fabos/switch/*/pflags_info && return $STS_ERR
+		;;
+		*"Not supported"*)
+		grep -q -s AOQ_AG /proc/fabos/switch/*/pflags_info && return $STS_ERR
+		;;
+		*)
+		;;
+    esac
+	return $STS_OK
+}
+
+#
+# Perform area range check only for Thor/Tomahawk/Spirit/Gladius
+# and block fwdl upon failure.
+#
+check_area_range() {
+	case ${SWBD##SWBD} in
+        '71'|'66'|'64'|'92')
+		/fabos/sbin/switchAreaRangeChk 2> /dev/null
+    	if [ $? -eq 0 ]; then
+        	return $STS_OK
+		else
+            return $STS_ERR
+    	fi
+        ;;
+    	*)
+        return $STS_OK
+        ;;
+    esac
+    return $STS_OK
+}
+
+#
+# Check for the config datadatabase only. Switchshow is not available
+# on the standby CP.
+#
+check_c2_mirror_on_standby() {
+
+	file_flag=0
+	/bin/ln -s /fabos/cliexec/lscfg_util /fabos/link_sbin/lscfg_test 2> /dev/null
+	file_flag=$?
+
+	export PATH=/fabos/link_bin:/bin:/usr/bin:/sbin:/usr/sbin:/fabos/link_abin:/fabos/link_sbin:/fabos/factory:/fabos/xtool
+
+	MAX_LGC=`lscfg_test --max`
+  	a_switch=0
+  	CHASSISCMD="cmd_chassis"
+
+	while [ "$a_switch" -le "$MAX_LGC" ]
+	do
+		/bin/ls /proc/fabos/switch/$a_switch  > /dev/null 2>&1
+			if [ $? -eq 0 ]; then
+				/bin/cat /proc/fabos/switch/$a_switch/info  2> /dev/null | grep -i "Mirror Port"  > /dev/null 2>&1
+			    if [ $? -eq 0 ]; then
+					if [ $file_flag -eq 0 ];then
+						/bin/rm /fabos/link_sbin/lscfg_test
+					fi
+		    	    return $STS_ERR
+		    	fi
+			fi
+		a_switch=`/usr/bin/expr $a_switch + 1`
+	done
+
+	mirror_cnt=`$CHASSISCMD /fabos/cliexec/configshow -all | grep -i "portmirrorcnt" | grep "1\|2\|3\|4" | cut -d ":" -f2 | wc -l`
+    	if [ $mirror_cnt -ne 0 ]; then
+			if [ $file_flag -eq 0 ];then
+				/bin/rm /fabos/link_sbin/lscfg_test
+			fi
+        	return $STS_ERR
+		fi
+
+	if [ $file_flag -eq 0 ];then
+		/bin/rm /fabos/link_sbin/lscfg_test
+	fi
+	return $STS_OK
+}
+
+check_if_ioddelay_set_in_activecp ()
+{
+    delay_val=`/fabos/cliexec/configshow | grep -i "route.iodDelay" | cut -d ":" -f2`
+
+    #
+    # Check if any of the configured value is GT 0. This is because
+    # -1 is default value.
+    #
+    for i in $delay_val; do
+        if [ $i -gt 0 ]; then
+            # Iod delay is configured. Fail the downgrade process.
+            return $STS_ERR
+        fi
+    done
+    return $STS_OK
+}
+
+check_if_ioddelay_set_in_standby ()
+{
+    delay_val=`/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 /fabos/cliexec/configshow | grep -i "route.iodDelay" | cut -d ":" -f2`
+
+    for i in $delay_val; do
+        if [ $i -gt 0 ]; then
+            # Iod delay is configured on standby. Fail downgrade process
+            return $STS_ERR
+        fi
+    done
+    return $STS_OK
+}
+
+check_for_ioddelay_set()
+{
+	if [ $ACTIVECP ]; then
+		check_if_ioddelay_set_in_activecp
+	else
+		check_if_ioddelay_set_in_standby
+	fi
+}
+
+check_ioddelay_set_in_contexts()
+{
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_if_ioddelay_set_in_activecp
+	else
+		check_if_ioddelay_set_in_activecp
+	fi
+}
+
+check_61_enc_hw_features()
+{
+	$ECHO check_61_enc_hw_features
+
+	TEST lance_present "$LANCEMSG"
+
+	TEST mace_present "$MACEMSG"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any of the 6.2 hardware
+# is active, e.g. whether a 6.2 blade/switch is enabled
+# or present.
+#
+check_62_hw_features()
+{
+	$ECHO check_62_hw_features
+
+	TEST pluto_chassis "$UNSUPPORTEDPLATFORMMSG"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any of the 6.3 hardware
+# is active, e.g. whether a 6.3 blade/switch is enabled
+# or present.
+#
+check_63_hw_features()
+{
+	$ECHO check_63_hw_features
+
+	TEST europa_present "$EUROPAMSG"
+
+	TEST striker_present "$STRIKERMSG"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any of the 6.4 hardware
+# is active, e.g. whether a 6.4 blade/switch is enabled
+# or present.
+#
+check_64_hw_features()
+{
+	$ECHO check_64_hw_features
+
+	TEST quattro_present "$QUATTROMSG"
+
+	return $RET_CODE
+}
+
+#
+# is_temp_license_present
+#
+# Check whether the temporary license is present on
+# the switch or not
+#
+# 6.1->6.0 no
+# 6.1->5.3 no
+# 5.3->6.1 yes
+# 6.0->6.1 yes
+#
+is_temp_license_present()
+{
+ 	hashow_cmd=$(ls /fabos/cliexec/hashow)
+ 	if [ "$hashow_cmd" != "/fabos/cliexec/hashow" ]; then
+ 		hashow_cmd="/fabos/bin/hashow"
+ 	fi
+
+ 	case "$($hashow_cmd | ( read a; echo $a ))" in
+			*Local*Active*)
+			temp_license_check_active
+ 			;;
+			*Local*Standby*)
+			temp_license_check_standby
+ 			;;
+			*"Not supported"*)
+			temp_license_check_active
+ 			;;
+			*)
+			;;
+	esac
+
+	lic_status=$?
+
+	return $lic_status
+}
+
+#
+# temp_license_check_active
+#
+# Check whether temporary license is installed on active CP
+#
+temp_license_check_active()
+{
+	/fabos/cliexec/licenseshow 2>${NULL} | grep "Expiry Date" > ${NULL} 2>&1
+	if [ $? -eq 0 ]
+	then
+		return 1
+	else
+		return 0
+	fi
+}
+
+#
+# temp_license_check_standby
+#
+# Check whether temporary license is installed on standby CP
+#
+temp_license_check_standby()
+{
+	sync=`/fabos/bin/hashow | sed -n -e 's/^.\+\(State sync\).\+$/\1/gp'`
+	if [ "$sync" != "State sync" ]; then
+		return 0
+	else
+		/usr/bin/rsh -n $(otherhost) /fabos/cliexec/licenseshow 2>${NULL} | grep "Expiry Date" ${NULL} 2>&1
+		if [ $? -eq 0 ]
+		then
+			return 1
+		else
+			return 0
+		fi
+	fi
+}
+
+lsan_matrix_supported()
+{
+	fcrmatrix=`/fabos/bin/fcrlsanmatrix | grep -E "FCR Matrix is activated"| wc -l`
+	return $fcrmatrix
+}
+
+
+# we need to check for condor2 ex_port configuration
+# before going down to 6.0. prevent any download
+# if any ex_ports are configured. We only need to do
+# this for Neptune since Spirit & Thor didn't show up
+# until 6.1
+check_condor2_ex_ports_configured() {
+    case ${SWBD##SWBD} in
+        '62' | '77')
+
+            correcthost /fabos/bin/switchshow |
+                /bin/grep -E '\<(EX-Port|Disabled|No_Sync|No_Module|No_Light)\>'|
+            while read index slot port rest
+            do
+	          if correcthost /fabos/link_bin/portshow $slot/$port | grep -q "portType.*17" ; then
+	            if correcthost /fabos/link_bin/portcfgexport $slot/$port | grep -q "Admin.*enabled" ; then
+	                $ECHO "downgrading to 6.0 with " $slot "/" $port " still being condor2 ex"
+	                return $STS_ERR
+	            fi
+	          fi
+            done
+			# The return above exits the subshell started by the pipe
+			# return here if the subshell exited early.
+			if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+    esac
+    return $STS_OK
+}
+
+
+# Check for VEX_PORT port configuration
+# before going down to 6.3. prevent any download
+# if any VEX_ports are configured. This needs to do
+# this for Striker.
+#
+check_vex_ports_configured() {
+	case ${SWBD##SWBD} in
+		'62' | '77')
+
+		striker="75"
+		if `/fabos/bin/slotshow | grep "${striker}" 1>/dev/null 2>&1`;
+		then
+			$ECHO "Striker Blade is present in SWBD" ${SWBD##SWBD}
+			check_vf_enabled
+			if [ $? -ne $STS_OK ]; then
+				# VF enabled
+				if [ $ACTIVECP ]; then
+					CHASSISCMD="cmd_chassis"
+					for_all_contexts check_striker_vex_ports_configured
+				else
+					for_all_contexts_standby check_striker_vex_ports_configured
+				fi
+			else
+				# VF disabled
+				check_striker_vex_ports_configured
+			fi
+			if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+		fi
+	esac
+	return $STS_OK
+}
+
+# Check for VE XISL s/w feature port configuration
+# before going down to 6.3 or 6.4. prevent any download
+# if any VE XISL is configuration is present. This needs to do
+# this for Striker.
+#
+check_for_ve_xisl_configuration() {
+	case ${SWBD##SWBD} in
+		'62' | '77')
+
+		striker="75"
+		if `correcthost_to_curr_vfid /fabos/bin/slotshow | grep "${striker}" 1>/dev/null 2>&1`;
+		then
+			$ECHO "Striker Blade is present in SWBD" ${SWBD##SWBD}
+			check_vf_enabled
+			if [ $? -ne $STS_OK ]; then
+				# VF enabled
+
+				# Get FID of Base switch, Default swich and List of LS switches
+
+				/bin/ln -sf /fabos/cliexec/lscfg_util /fabos/link_sbin/lscfg_test
+				X_BS=`lscfg_test --all | grep Base | awk {'print $2'}`
+				X_DS=`lscfg_test --all | grep Default | awk {'print $2'}`
+
+				X_max=`lscfg_test --all | grep Logical | awk {'print $2'} | wc -l`
+
+				if [ $X_max -gt 0 ]
+				then
+					X_LS=( `lscfg_test --all |grep Logical | awk {' print $2 '} ` )
+				else
+					context_switch chassis
+					glb_vf_id="$CURRENT_VF"
+					glb_ls_id="$FABOS_SWITCHNO"
+					return $STS_OK
+				fi
+				
+				X_Flag=0
+				for i_index in ${X_LS[@]}
+				do
+					context_switch $i_index
+					glb_vf_id="$CURRENT_VF"
+					glb_ls_id="$FABOS_SWITCHNO"
+
+					XISL_use=`correcthost_to_curr_vfid /fabos/link_bin/switchshow | grep "Allow XISL" | awk '{ print $4 }'`
+					if [ "${XISL_use}" == "ON" ]
+					then
+						X_Flag=1
+						if [ `correcthost_to_curr_vfid /fabos/link_bin/switchshow | grep "VE" | wc -l` -gt 0 ]
+						then
+							context_switch chassis
+							glb_vf_id="$CURRENT_VF"
+							glb_ls_id="$FABOS_SWITCHNO"
+							return $STS_ERR
+						fi
+
+						if [ `correcthost_to_curr_vfid /fabos/link_bin/switchshow | grep "ge" | wc -l` -gt 0 ]
+						then
+							context_switch chassis
+							glb_vf_id="$CURRENT_VF"
+							glb_ls_id="$FABOS_SWITCHNO"
+							return $STS_ERR
+						fi
+					fi
+				done
+
+				if [ ${X_Flag} -eq 1 ]
+				then
+					if [ "x${X_BS}" == "x" ]
+					then
+						context_switch chassis
+						glb_vf_id="$CURRENT_VF"
+						glb_ls_id="$FABOS_SWITCHNO"
+						return $STS_OK
+					fi
+
+					context_switch $X_BS
+					glb_vf_id="$CURRENT_VF"
+					glb_ls_id="$FABOS_SWITCHNO"
+
+					if [ `correcthost_to_curr_vfid /fabos/link_bin/switchshow | grep "VE" | wc -l` -gt 0 ]
+					then
+						context_switch chassis
+						glb_vf_id="$CURRENT_VF"
+						glb_ls_id="$FABOS_SWITCHNO"
+						return $STS_ERR
+					fi
+
+					if [ `correcthost_to_curr_vfid /fabos/link_bin/switchshow | grep "ge" | wc -l` -gt 0 ]
+					then
+						context_switch chassis
+						glb_vf_id="$CURRENT_VF"
+						glb_ls_id="$FABOS_SWITCHNO"
+						return $STS_ERR
+					fi
+				fi	
+
+				context_switch chassis
+				glb_vf_id="$CURRENT_VF"
+				glb_ls_id="$FABOS_SWITCHNO"
+				return $STS_OK		
+
+			else
+				# VF disabled
+				return $STS_OK		
+			fi
+		fi
+	esac
+	return $STS_OK
+}
+
+#
+# check if VEX port configured on any striker blade in every logical switch
+# If so fail the downgrade below 6.4
+#
+check_striker_vex_ports_configured() {
+	striker="75"
+
+   	/fabos/bin/slotshow | grep "${striker}" |
+	while read str_slot restyy
+	do
+		correcthost_to_curr_vfid /fabos/bin/switchshow -slot $str_slot | grep "VE" |
+		while read index slot port restyy
+		do
+			$ECHO $slot $port "-" "$glb_ls_id" $glb_vf_id $CURRENT_VF
+			if `correcthost_to_curr_vfid /fabos/link_bin/portcfgvexport $slot/$port |
+			    grep -q "Admin.*enabled"` ; then
+				echo -e "Downgrading with slot" $slot ", port" $port "still configured as VEX"
+
+				check_vf_enabled
+				if [ $? -ne $STS_OK ]; then
+					if [ $ACTIVECP ]; then
+						echo -e "in logical switch ( FID =" $CURRENT_VF ")"
+					else
+						echo -e "in logical switch ( FID =" $glb_vf_id ")"
+					fi
+				fi
+				echo -e "\n$DOWNGRADEWITHVEX\n"
+				# due to the pipe, return is just like break from current while loop.
+				return $STS_ERR
+			fi
+		done
+		if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+	done
+
+	# The return above exits the subshell started by the pipe
+	# return here if the subshell exited early.
+	if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+
+	return $STS_OK
+}
+
+
+#
+# Check for NOS mode (IM5) EX_PORT before downgrading to lower version of
+# v7.0.1 (Toro release). This is wrapper function which will be executed per LS
+# if VF is enabled. We need to call this function for all the allowable
+# downgrade version of v7.0.1 (both disruptive/non-disruptive)
+#
+
+check_nos_ex_ports() {
+	if [ $CUR_MAJOR -eq 7 -a $CUR_MINOR -eq 0 -a $CUR_PATCH -eq 1 ]; then
+		 if [ $TO_MAJOR -eq 7 -a $TO_MINOR -eq 0 -a $TO_PATCH -eq 0 ] || [ $TO_MAJOR -eq 6 ]; then
+			check_vf_enabled
+			if [ $? -ne $STS_OK ]; then
+				# VF enabled
+					CHASSISCMD="cmd_chassis"
+					for_all_contexts check_nos_ex_ports_configured
+			else
+				# VF disabled
+				check_nos_ex_ports_configured
+			fi
+			if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+		fi
+	fi
+	return $STS_OK
+}
+
+check_nos_ex_ports_configured() {
+		if `correcthost_to_curr_vfid /fabos/bin/slotshow |grep "ENABLED" 1>/dev/null 2>&1` ;
+		then
+	        correcthost_to_curr_vfid /fabos/bin/switchshow |
+    	          /bin/grep -E '\<(EX-Port|Disabled|No_Sync|No_Module|No_Light)\>'|
+        	while read index slot port restyy
+	        do
+            	$ECHO $slot $port "-" "$glb_ls_id" $glb_vf_id $CURRENT_VF
+         	   if `correcthost_to_curr_vfid /fabos/link_bin/portcfgexport $slot/$port |
+                grep -q "Operate mode.*NOS"` ; then
+                add_err_status " * One or more EX-Port on slot $slot is configured in Brocade NOS Interop-mode"
+
+                # due to the pipe, return is just like break from current while
+                # loop.
+				return $STS_ERR
+            	fi
+	        done
+    		if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+		    # The return above exits the subshell started by the pipe
+		    # return here if the subshell exited early.
+    		if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+		else 
+			check_nos_ex_ports_configured_pizzabox
+    		if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+		fi
+	return $STS_OK
+}
+
+check_nos_ex_ports_configured_pizzabox() {
+        correcthost_to_curr_vfid /fabos/bin/switchshow |
+			grep -E '\<(EX-Port|Disabled|No_Sync|No_Module|No_Light)\>'| 
+		while read index port restyy
+        do
+            $ECHO $port "-" "$glb_ls_id" $glb_vf_id $CURRENT_VF
+            if `correcthost_to_curr_vfid /fabos/link_bin/portcfgexport $port |
+                grep -q "Operate mode.*NOS"` ; then
+                add_err_status " * One or more EX-Port is configured in Brocade NOS Interop-mode"
+
+                # due to the pipe, return is just like break from current while
+                # loop.
+				return $STS_ERR
+            fi
+        done
+    	if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+	    # The return above exits the subshell started by the pipe
+	    # return here if the subshell exited early.
+    		if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+
+	return $STS_OK
+}
+#
+# Check for Marathon EX_PORT port configuration
+# before upgrading to 7.0. prevent any download
+#
+check_condor_ex_ports_configured() {
+	case ${SWBD##SWBD} in
+		'62' | '77')
+
+		marathon="24"
+		correcthost_to_curr_vfid /fabos/bin/slotshow | grep "${marathon}" 1>/dev/null 2>&1
+		if [ $? -eq 0 ]
+		then
+			check_vf_enabled
+			if [ $? -ne $STS_OK ]; then
+				# VF enabled
+					CHASSISCMD="cmd_chassis"
+					for_all_contexts check_marathon_ex_ports_configured
+			else
+				# VF disabled
+				check_marathon_ex_ports_configured
+			fi
+			if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+		fi
+	esac
+	return $STS_OK
+}
+
+#
+# check if EX port configured on any marathon blade in every logical switch
+# If so fail the upgrade to 7.0
+#
+check_marathon_ex_ports_configured() {
+    marathon="24"
+
+    correcthost_to_curr_vfid /fabos/bin/slotshow | grep "${marathon}" |
+    while read str_slot restyy
+    do
+        correcthost_to_curr_vfid /fabos/bin/switchshow -slot $str_slot | grep "FC" |
+        while read index slot port restyy
+        do
+            $ECHO $slot $port "-" "$glb_ls_id" $glb_vf_id $CURRENT_VF
+            if `correcthost_to_curr_vfid /fabos/link_bin/portcfgexport $slot/$port |
+                grep -q "Admin.*enabled"` ; then
+                add_err_status " * One or more port on slot $slot is configured as EX-Port."
+
+                # due to the pipe, return is just like break from current while
+                # loop.
+				return $STS_ERR
+            fi
+        done
+    	if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+    done
+
+    # The return above exits the subshell started by the pipe
+    # return here if the subshell exited early.
+    if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+
+	return $STS_OK
+}
+# Check for more than 2 FX-8 blades plugged in to chassis
+# before going down to 6.3. prevent any download
+# if more than 2 Striker blades are plugged in.
+#
+check_striker_4blades() {
+
+	STRIKER=$(/fabos/cliexec/slotshow | grep " 75 " | wc -l)
+	if [ $STRIKER -gt 2 ]
+	then
+	return $STS_ERR
+	else
+	return $STS_OK
+	fi
+}
+
+
+# Check for CSCTL Mode configuration
+# before going down to 6.3. prevent any download
+# if CSCTL is configured for any port. This needs to do
+# this for C2 and GEYE2.
+#
+check_csctl_configured() {
+    case ${SWBD##SWBD} in
+		'71'|'62'|'66'|'64'|'77'|'42'|'72'|'73'|'75'|'67'|'92')
+
+		check_vf_enabled
+		if [ $? -ne $STS_OK ]; then
+            # VF enabled
+                CHASSISCMD="cmd_chassis"
+                for_all_contexts check_csctl
+        else
+            # VF disabled
+                check_csctl
+        fi
+        if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+    esac
+    return $STS_OK
+}
+
+check_csctl() {
+    if correcthost_to_curr_vfid /fabos/link_bin/portcfgshow | grep "CSCTL mode" | grep -q ON; then
+        return $STS_ERR
+    else
+        return $STS_OK
+    fi
+}
+# Check for locked E-port and prevent downgrade from 6.4 if
+# any port is configured as E-port only.
+#
+check_locked_eport() {
+
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		# VF enabled
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts locked_eport
+	else
+		# VF disabled
+		locked_eport
+	fi
+	if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+}
+
+locked_eport() {
+
+	if correcthost_to_curr_vfid /fabos/link_bin/portcfgshow | grep "Locked E_Port" | grep -q ON; then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+# Check for portname length > 32bytes and prevent downgrade from 7.0
+# to Pre v6.4.3 
+# if any port having portname length > 32bytes.
+#
+check_portname_len() {
+	#
+	# Check portname length only if downgrading to Pre v6.4.3
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -ge 3 ]; then
+		return $STS_OK
+	fi
+
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		# VF enabled
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts port_namelen
+	else
+		# VF disabled
+		port_namelen
+	fi
+	if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+}
+
+# check for Condor3 blade is present or not
+check_C3_blades() {
+	if `/fabos/bin/slotshow | grep -E "96|97|98|99" 1>/dev/null 2>&1`;
+	then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+# check for Enhanced FC8 blade is present or not
+check_ENHANCED_FC8_blades() {
+	if `/fabos/bin/slotshow | grep -E "125|126" 1>/dev/null 2>&1`;
+	then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+# Check for PAD feature without option/events configured
+check_PAD_feature() {
+	CHASSISCMD="cmd_chassis"
+	for_all_contexts check_PAD_enabled
+	if [ $? -eq 0 ]; then
+        return $STS_OK
+    else
+        return $STS_ERR
+    fi
+}
+
+check_PAD_enabled() {
+	/fabos/sbin/portcfgautodisable fwdl_downgrade | grep "PAD" | grep enabled > /dev/null 2>&1;
+	if [ $? -eq 0 ]; then
+        return $STS_ERR
+    else
+        return $STS_OK
+    fi
+}
+
+# Check for configured fillword and prevent downgrade from 6.4 if
+# any port is configured as > 1 .
+# 2- /-idle-arbff  - IDLE  in Link Init, ARBFF as fill word (SW)
+# 3- /-aa-then-ia  - If ARBFF/ARBFF failed, then do IDLE/ARBFF
+#
+check_cfg_fill_word_all_instances() {
+
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		# VF enabled
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts check_cfg_fill_word
+	else
+		check_cfg_fill_word
+	fi
+	if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+}
+
+port_namelen() {
+	correcthost_to_curr_vfid /fabos/sbin/portname | grep "port" |
+	while read -ers line
+	do
+		name=${line#*: }
+		size=${#name}
+		if [ $size -gt 32 ]; then
+			return $STS_ERR
+		fi
+	done
+	if [ $? -eq $STS_ERR ] ; then return $STS_ERR ; fi
+	return $STS_OK
+}
+
+check_cfg_fill_word() {
+
+	if correcthost_to_curr_vfid /fabos/link_bin/portcfgshow | grep "Fill Word" | grep -q " 2 "; then
+		return $STS_ERR
+	fi
+
+	if correcthost_to_curr_vfid /fabos/link_bin/portcfgshow | grep "Fill Word" | grep -q " 3 "; then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+# Check for configured 16G/10G speed  and prevent downgrade from 7.0 if
+# any port is configured.
+#       
+check_cfg_speed() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		# VF enabled
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts port_speedcheck
+	else
+		port_speedcheck
+	fi
+	if [ $? -ne $STS_OK ]; then return $STS_ERR ; fi
+}
+
+port_speedcheck() {
+	if correcthost_to_curr_vfid /fabos/link_bin/switchshow | awk '{ if ($8 != "FCoE") print $6;}' | grep -qi -e "10G" -e "16G"; then
+		return $STS_ERR
+	fi
+	return $STS_OK
+}
+
+#
+# check_ethsw_enabled
+#
+# Check whether ETHSW is enabled
+#
+check_ethsw_enabled() {
+
+	if [ ${SWBD##SWBD} == '76' ]; then
+		return $STS_OK
+	fi
+
+	/sbin/getethsw > /dev/null 2>&1
+    if [ $? -eq 1 ]; then
+        return $STS_ERR
+    else
+        return $STS_OK
+    fi
+
+}
+
+check_switch_8bit_def_sw_mode() {
+	if [ $ACTIVECP ]; then
+		check_switch_8bit_def_sw_mode_active
+	else
+		check_switch_8bit_def_sw_mode_standby
+	fi
+}
+
+check_switch_8bit_def_sw_mode_active() {
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		/fabos/sbin/switch8BitDynDefAreaEnabled 2> /dev/null
+		if [ $? -eq 1 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+		return $STS_OK
+	fi
+}
+
+check_switch_8bit_def_sw_mode_standby() {
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		unique_8bit_cmd=`/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 /bin/ls /fabos/sbin/switch8BitDynDefAreaEnabled 2> /dev/null`
+        if [ "$unique_8bit_cmd" != "/fabos/sbin/switch8BitDynDefAreaEnabled" ]; then
+            return $STS_OK
+        fi
+
+		/usr/bin/rsh -n $(otherhost) ROLE_ID=root LOGIN_ID=root CURRENT_AD=0 '/fabos/sbin/switch8BitDynDefAreaEnabled; echo $?' | grep -v "1" 2> /dev/null
+		if [ $? -eq 0 ]; then
+			return $STS_OK
+		else
+			return $STS_ERR
+		fi
+	else
+		return $STS_OK
+	fi
+}
+
+#
+# fcr_enabled
+#
+# Check whether FCR is enabled
+#
+check_fcr_enabled() {
+
+	/fabos/bin/fosconfig --show | grep "FC Routing service" | grep enabled > /dev/null 2>&1
+	if [ $? -eq 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+#
+# check_hcl_switchstate
+#
+# Check the switchState if it is Faulty to block HCL
+#
+check_hcl_switchstate()
+{
+	hashow_cmd="/fabos/bin/hashow"
+
+	case "$($hashow_cmd | ( read a; echo $a ))" in
+		*"Not supported"*)
+		;;
+		*)
+		return $STS_OK
+		;;
+	esac
+
+	switch_state=`/fabos/bin/switchshow | sed -n -e 's/switchState://gp' | tr -d '\t'`
+
+	if [ $switch_state == "Faulty" ]; then
+		is_fwdl_arg "s"
+		if [ $? -ne 0 ]; then
+			return $STS_ERR
+		fi
+	fi
+
+	return $STS_OK
+
+}
+
+CMSH_DEBUG="/fabos/factory/cmsh_debug"
+#
+# Check for sflow in running or startup configuration.
+#
+check_sflow_enabled()
+{
+	if [ ${SWBD##SWBD} == '76' ]; then
+		sflowRunningConfig=`${CMSH_DEBUG} -e "show running-config" | grep sflow | wc -l`
+		sflowStartupConfig=`${CMSH_DEBUG} -e "show startup-config" | grep sflow | wc -l`
+
+		if [ $sflowRunningConfig -gt 0 ];
+		then
+			return $STS_ERR
+		elif [ $sflowStartupConfig -gt 0 ];
+		then
+			return $STS_ERR
+		fi
+	fi
+
+	return $STS_OK
+}
+
+#
+# Check for dot1x in running or startup configuration.
+#
+check_dot1x_enabled()
+{
+	if [ ${SWBD##SWBD} == '76' ]; then
+		dot1xRunningConfig=`${CMSH_DEBUG} -e "show running-config" | grep dot1x | wc -l`
+		dot1xStartupConfig=`${CMSH_DEBUG} -e "show startup-config" | grep dot1x | wc -l`
+
+		if [ $dot1xRunningConfig -gt 0 ];
+		then
+			return $STS_ERR
+		elif [ $dot1xStartupConfig -gt 0 ];
+		then
+			return $STS_ERR
+		fi
+	fi
+
+	return $STS_OK
+}
+
+#
+# Check if there is one EE with disk and tape containers hosted
+#
+check_disk_tape_coexist()
+{
+	DISKTAPE=`/fabos/cliexec/configshow | grep cvlm.disk_tape | cut -f 2 -d ':'`
+
+	if [ -z $DISKTAPE ]; then
+		return $STS_OK;
+	fi
+
+	if [ "$DISKTAPE" = "0x0" ]; then
+		return $STS_OK;
+	fi
+
+	return $STS_ERR
+}
+
+#
+# Check if usres with user-defined roles on 7.0 switch
+#
+check_udrole_users_presence()
+{
+	if [ $CUR_MAJOR -eq 7 -a $CUR_MINOR -ge 0 ]; then
+	if [  $TO_MAJOR -le 6 ]; then
+		/fabos/libexec/userdb_convert $CUR_MAJOR.$CUR_MINOR $TO_MAJOR.$TO_MINOR $PREINST > /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			return $STS_ERR;
+		fi
+	fi
+	fi
+
+
+	return $STS_OK
+}
+
+#
+# Check if there is any entry in certificate configuratio database
+# that is configured to use third party issued certificates with
+# the peer switch.
+#
+check_sec_auth_certificate_database()
+{
+    FCAP_DIR="/etc/fabos/pki/tp"
+    FCAP_SWCERT_FILE="switch.0.crt"
+    FCAP_CACERT_FILE="switch.0.rootcrt"
+    FCAP_SWCSR_FILE="switch.0.csr"
+
+    if ! ( [ $CUR_MAJOR -eq 7 ] && [ $CUR_MINOR -eq 0 ] && [ $TO_MAJOR -eq 6 ] && [ $TO_MINOR -eq 3 ] ); then
+        MAX_NUM_SW=8
+        for (( i = 0 ; i <= $MAX_NUM_SW ; i++ ))
+        do
+            FCAP_CONF_FILE=`echo /etc/fabos/auth.$i.fcap.conf`
+
+            if [ -f $FCAP_CONF_FILE ]; then
+                IFS_=${IFS}; IFS=$'\n'
+                for LINE in `cat $FCAP_CONF_FILE`
+                do
+                    CONF_VAL=`echo "$LINE" | awk ' {print $2} '`
+                    if [ $CONF_VAL -eq 1 ]; then
+                        return $STS_ERR
+                    fi
+                done
+                IFS=${IFS_}
+            fi
+        done
+    fi
+
+    if [ -s $FCAP_DIR/$FCAP_SWCERT_FILE ]; then
+	    return $STS_ERR
+    fi
+
+    if [ -s $FCAP_DIR/$FCAP_CACERT_FILE ]; then
+ 	    return $STS_ERR
+    fi
+
+    if [ -s $FCAP_DIR/$FCAP_SWCSR_FILE ] ; then
+	    return $STS_ERR
+    fi
+
+    return $STS_OK
+}
+
+#           
+# Check if there is any entry in certificate configuration database
+# that is configured to use Brocade issued certificates with
+# the peer switch or if the Brocade issued certificate is installed
+# in the switch.
+#
+check_sec_auth_certificate_database_for_brcd()
+{
+    FCAP_DIR="/etc/fabos/pki"
+    FCAP_SWCERT_FILE="switch.0.crt"
+    MAX_NUM_SW=8
+    for (( i = 0 ; i <= $MAX_NUM_SW ; i++ ))
+    do  
+    FCAP_CONF_FILE=`echo /etc/fabos/auth.$i.fcap.conf`
+
+    if [ -f $FCAP_CONF_FILE ]; then
+        IFS_=${IFS}; IFS=$'\n'
+		for LINE in `cat $FCAP_CONF_FILE`
+		do
+				CONF_VAL=`echo "$LINE" | awk ' {print $2} '`
+					if [ $CONF_VAL -eq 0 ]; then
+				return $STS_ERR
+			fi
+		done
+		IFS=${IFS_}
+	fi
+	done
+
+    if [ -s $FCAP_DIR/$FCAP_SWCERT_FILE ]; then
+        return $STS_ERR
+    fi
+
+    return $STS_OK
+}
+		
+#
+# Check if System Card feature is enabled
+#
+check_syscard_enabled()
+{
+    SYSCARDENABLECHECK=`/fabos/cliexec/configshow | grep scEnabled | cut -f 2 -d ':'`
+
+    if [ -z $SYSCARDENABLECHECK ]; then
+        return $STS_OK;
+    fi
+
+    if [ "$SYSCARDENABLECHECK" = "0x0" ]; then
+        return $STS_OK;
+    fi
+
+    return $STS_ERR
+}
+
+#
+# Check if Qourum size is non-zero before downgrading
+#
+check_qourumcard_size()
+{
+    QOURUMSIZE=`/fabos/cliexec/configshow | grep spm.encrGrp.qc.msize | cut -f 2 -d ':'`
+
+    if [ -z $QOURUMSIZE ]; then
+        return $STS_OK;
+    fi
+
+    if [ "$QOURUMSIZE" = "0x0" ]; then
+        return $STS_OK;
+    fi
+    return $STS_ERR
+}
+#
+# Check if Secondary RKM keyvault is configured
+# before upgrading to v6.3,0
+#
+check_sec_rkm_kv()
+{
+	KVTYPE=`/fabos/cliexec/configshow | grep spm.encrGrp.kvType | cut -f 2 -d ':'`
+
+	if [ -z "$KVTYPE" ]; then
+		return $STS_OK;
+	fi
+
+	if [ "$KVTYPE" = "0x2" ]; then
+		SECKV=`/fabos/cliexec/configshow | grep spm.encrGrp.secKV.cert.ip | cut -f 2 -d ':'`
+
+		if [ -z "$SECKV" ]; then
+			return $STS_OK;
+		else
+			return $STS_ERR;
+		fi
+	fi
+	return $STS_OK;
+}
+
+#
+# Check if Secondary SKM keyvault is configured
+# before upgrading to v6.3,0
+#
+check_sec_skm_kv()
+{
+	KVTYPE=`/fabos/cliexec/configshow | grep spm.encrGrp.kvType | cut -f 2 -d ':'`
+
+	if [ -z "$KVTYPE" ]; then
+		return $STS_OK;
+	fi
+
+	if [ "$KVTYPE" = "0x5" ]; then
+		SECKV=`/fabos/cliexec/configshow | grep spm.encrGrp.secKV.cert.ip | cut -f 2 -d ':'`
+
+		if [ -z "$SECKV" ]; then
+			return $STS_OK;
+		else
+			return $STS_ERR;
+		fi
+	fi
+	return $STS_OK;
+}
+#
+# This routine checks if the ports from 1400-1527 are
+# assigned to any LS while downgrading from 6.4 to 6.3
+#
+check_ls_ports()
+{
+	$ECHO check_ls_ports
+
+    case ${SWBD##SWBD} in
+    '62' | '77')
+	    LSCHECKPORT=`/fabos/link_sbin/hasmtest lscheckport 768 895 0 1 | cut -d "=" -f2`
+	    if [ $LSCHECKPORT -ne 0 ]; then
+			quattro_present
+			if [ $? -eq 0 ]; then
+				return $STS_ERR
+			fi
+		fi
+        ;;
+    *)
+        ;;
+    esac
+
+	return $STS_OK
+}
+
+# This routine looks for Lossless DPS to be set on any of the logical switches.
+# Pre-v6.4 versions do not support Lossless DPS, so if Lossless DPS is enabled,
+# downgrade needs to be blocked.
+#
+# Please Note: Lossless DLS is supported on pre-v6.4.  Downgrade will be
+# allowed for Lossless DLS.  The difference has to do with which routing
+# policy is set:
+#		DLS + Lossless + Exchange based == Lossless DPS (IOD optional)
+#		DLS + IOD + Lossless + Port based == Lossless DLS
+#
+check_lossless_dps_in_contexts()
+{
+	# If we find Lossless DPS enabled on any logical switch, block downgrade.
+    check_vf_enabled
+    if [ $? -ne $STS_OK ]; then
+        CHASSISCMD="cmd_chassis"
+        for_all_contexts check_lossless_dps
+    else
+        check_lossless_dps
+    fi
+}
+
+# This routine checks for Lossless DPS to be enabled.
+#
+check_lossless_dps()
+{
+	policy=`/fabos/cliexec/config get rte.external_policy 2` ;
+	lossless=`/fabos/cliexec/config get route.lossless 2` ;
+	dls=`/fabos/cliexec/config get route.stickyRoutes 2` ;
+	iod=`/fabos/cliexec/config get route.delayReroute 2` ;
+
+	#
+	# If we have an exchange-based routing policy, and lossless is set,
+	# and DLS is enabled, then Lossless DPS is active.  Otherwise it is
+	# not active.
+	#
+	if [ $lossless -eq 1 ]; then
+		if [ -z "$policy" ]; then
+			# If no policy, then default policy (exchange-based) is active
+			# Firmwaredownload is disallowed.
+			return $STS_ERR ;
+		fi
+
+		# If Lossless DLS is enabled, firmwaredownload is allowed.
+		# Lossless DLS is port based, dls on, iod on, lossless on.
+		if [ $policy -eq 1 ] && [ $dls -eq 0 ] &&
+			[ $lossless -eq 1 ] && [ $iod -ne 0 ]; then
+			return $STS_OK ;
+		fi
+	else
+		# If Lossless is not enabled, firmwaredownload is allowed
+		return $STS_OK ;
+	fi
+
+	# Anytime Lossless is enabled and it is not Lossless DLS, then
+	# firmwaredownload is not allowed.
+	return $STS_ERR ;
+}
+check_ve_ports() {
+
+	correcthost_to_curr_vfid /fabos/bin/switchshow  | grep "FCoE VE-Port"  > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        return $STS_ERR
+    else
+        return $STS_OK
+    fi
+	
+}	
+
+
+#
+# fcoe_veports_enabled
+#
+# Check whether FCoE VE ports are enabled. This feature exists in 6.4.1 only.
+#
+fcoe_veports_enabled() {
+
+	CHASSISCMD="cmd_chassis"
+
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_ve_ports
+	else
+		check_ve_ports
+	fi
+
+    if [ $? -eq 0 ]; then
+        return $STS_OK
+    else
+        return $STS_ERR
+    fi
+}
+
+#Check for Europa blade count
+check_europa_blade_count_support() {
+	
+	EUROPA_BLADE_COUNT=`/fabos/cliexec/slotshow | grep " 74 " | wc -l`
+
+	if [ $EUROPA_BLADE_COUNT -gt 2 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+check_feature_state()
+{
+    feature=$1
+    if [ `/fabos/cliexec/configshow | grep "$feature" |wc -l` -gt 0 ]; then
+        state=`/fabos/cliexec/configshow | grep "$feature" | cut -d ":" -f2`
+        if [ $state == "0x0" ]
+        then
+            return $STS_OK
+        else
+            return $STS_ERR
+        fi
+    else
+        return $STS_OK
+    fi
+}
+
+
+#
+# Check if  Europa blade is power on.
+#
+check_if_Europa_blade_is_power_on() {
+	
+	EUROPA_POWER_ON=`/fabos/cliexec/slotshow | grep " 74 " | grep -v "INSERTED, NOT POWERED ON" | wc -l`
+
+	if [ $EUROPA_POWER_ON -gt 0 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+
+# From Matador (7.0), seconds timebase is not supported on Fabric watch
+
+check_fw_seconds_timebase_allinstances()
+{
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_fw_seconds_timebase
+	else
+		check_fw_seconds_timebase
+	fi
+
+}
+
+check_fw_seconds_timebase()
+{
+	LISTTIMEBASE=`/fabos/cliexec/configshow | grep "thresh" | grep -F ".tb"`
+
+	for i in $LISTTIMEBASE
+	do
+		SECONDSTIMEBASE=`echo $i | cut -d ":" -f 2` 
+
+		if [ $SECONDSTIMEBASE -eq 1 ]; then
+			class=`echo $i | cut -d "." -f3`
+			area=`echo $i | cut -d "." -f4`
+			add_err_status "$UNSUPPORTED_CHECK_SECOND_TIMEBASE1 for class $class, area $area on FID $CURRENT_VF." 
+			return $STS_ERR
+		fi
+	done 
+
+	return $STS_OK
+
+}
+
+check_veport_threshconfig_allinstances()
+{
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+	   for_all_contexts check_veport_threshconfig
+	else
+	   check_veport_threshconfig
+	fi
+}
+
+check_veport_threshconfig()
+{
+	POSTDECIMAL=`/fabos/cliexec/configshow | grep "Pktloss" | cut -d "." -f 6`
+	if [ -z $POSTDECIMAL ]; then
+		return $STS_OK
+	else
+		return $STS_ERR
+	fi
+
+}
+
+check_flt_mon_config_6_3()
+{
+	flt=`/fabos/bin/configshow -all | grep -w perf.fltmonc | wc -l`
+	if [ $flt -ge 1 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+}
+check_flt_mon_config_allinstances()
+{
+    check_vf_enabled
+
+   if [ $? -ne $STS_OK ]; then
+		# VF is enabled
+		if [ $ACTIVECP ]; then
+        	for_all_contexts check_flt_mon_config
+		else
+			return $STS_OK
+		fi
+    else
+        check_flt_mon_config
+    fi
+}
+
+check_flt_mon_config ()
+{
+	# Check if fmconfig is enabled.
+	# If enabled then firmwaredownload is allowed.
+    fm=`/fabos/cliexec/config get perf.framemon.enabled 1`
+    if [ $fm -eq 1 ]; then
+        return "$STS_OK"
+	else
+		#
+		# If not enabled then check if filter monitor configurations are
+		# present.
+		#
+		/bin/rm -f /tmp/flt.dbg
+		/fabos/link_bin/ps_dump -f > /dev/null 2>&1
+	
+		# If file empty then no filter monitor configurations are present.
+		if [ ! -s /tmp/flt.dbg ]; then
+			return "$STS_OK"
+		else
+			#If filter monitor configurations are present then return error.
+			flt=`sed -n '/PS_VFID/,/Port/p' /tmp/flt.dbg | sed -e 's/PS_V/;/g'`
+			for i in `seq 2 9`; do
+				echo $flt | cut -d ';' -f $i | grep "FID $glb_vf_id" | grep Port > /dev/null
+				if [ $? -eq 0 ]; then 
+					return $STS_ERR
+				fi
+			done
+		fi
+	fi
+	return "$STS_OK"
+}
+#check if buffer optimization mode is enabled
+check_buf_op_enabled()
+{
+	if [ -f "/fabos/sbin/bufopmode" ]; then
+		/fabos/sbin/bufopmode --showall| grep "On" > /dev/null 2>&1
+
+		if [ $? -eq 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+		return $STS_OK
+	fi
+}
+
+#check if serdes tuning mode is enabled
+check_serdes_tune_enabled()
+{
+	if [ -f "/fabos/sbin/serdestunemode" ]; then
+		/fabos/sbin/serdestunemode --show| grep "enabled" > /dev/null 2>&1
+
+		if [ $? -eq 0 ]; then
+			return $STS_ERR
+		else
+			return $STS_OK
+		fi
+	else
+		return $STS_OK
+	fi
+}
+
+remove_swstatus_cfg_key() {
+
+	for  key in `/fabos/bin/configshow | grep percentage.MarginalPorts | cut -f 1 -d ':'`
+	do
+		/fabos/cliexec/config remove $key
+	done
+
+	for  key1 in `/fabos/bin/configshow | grep percentage.FaultyPorts | cut -f 1 -d ':'`
+	do
+		/fabos/cliexec/config remove $key1
+	done
+
+	for key2 in `/fabos/bin/configshow | grep percentage.MissingSFPs | cut -f 1 -d ':'`
+	do
+		/fabos/cliexec/config remove $key2
+	done
+
+	/fabos/cliexec/configcommit ;
+}
+
+check_swstatus_cfg_key() {
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts remove_swstatus_cfg_key
+	else
+		remove_swstatus_cfg_key
+	fi
+}
+
+#check if LDAP is configured over IPv6
+check_ldap_ipv6_configuration()
+{
+        rval=$STS_OK
+	if [ -f "/etc/fabos/ldap.conf" ]; then
+		more /etc/fabos/ldap.conf | cut -f1 |
+		while read a
+		do
+			echo $a | cut -f2,3 -d":" | grep -q ":"
+			if test $? -eq 0
+			then
+				return $STS_ERR
+			fi
+		done;
+		if [ $? -ne $STS_OK ]; then rval=$STS_ERR; fi
+	fi
+        return $rval
+}
+
+check_rte_policy()
+{		
+	dbr=`aptpolicy | grep Current | grep 2 | wc -l`
+	if [ $dbr -eq 1 ]; then
+		return $STS_ERR
+	else
+		return $STS_OK
+	fi
+
+}
+
+check_rte_policy_in_contexts()
+{
+	check_vf_enabled
+	if [ $? -ne $STS_OK ]; then
+		for_all_contexts check_rte_policy
+	else
+		check_rte_policy
+	fi
+}
+
+#Checks any d_port configured as DWDM mode
+check_dwdm_d_port_config()
+{
+    local d_ports=`/fabos/link_bin/portcfgshow | grep "D-Port over DWDM" | grep "ON" | wc -l | sed 's/ //g'`
+
+    if [ "$d_ports" == "0" ]; then
+        return $STS_OK
+    fi
+    return $STS_ERR
+
+}
+
+#check any r_rdy mode port is configured as d_port
+check_d_port_dwdm_support()
+{
+    check_vf_enabled
+
+    if [ $? -ne $STS_OK ]; then
+        CHASSISCMD="cmd_chassis"
+        for_all_contexts check_dwdm_d_port_config
+    else
+        check_dwdm_d_port_config
+    fi
+
+    if [ $? -eq $STS_OK ]; then
+        return $STS_OK
+    else
+        return $STS_ERR
+    fi
+
+}
+
+#Checks any r_rdy mode port is configured as d_port
+check_r_rdy_d_port_config()
+{
+    local isl_ports=`/fabos/link_bin/portcfgshow | grep "ISL R_RDY Mode" | grep "ON" | wc -l | sed 's/ //g'`
+    local d_ports=`/fabos/link_bin/portcfgshow | grep "D-Port mode" | grep "ON" | wc -l | sed 's/ //g'`
+
+    PORT_NUM=0
+
+    #Either no r-rdy ports or d_ports
+    if [ "$isl_ports" == "0" ] || [ "$d_ports" == "0" ]; then
+        return $STS_OK
+    fi
+
+    D_PORT_CONF=/tmp/tmp_dport_show_tmp.txt
+    /fabos/link_bin/portdporttest --show all | grep "[0-9]" > $D_PORT_CONF
+
+    NEED_SLOT_NUM=`/fabos/link_bin/portdporttest --show all |  grep -i "slot" |  wc -l`
+    while read line
+    do
+        if [ $NEED_SLOT_NUM -eq 1 ]; then
+            tempslot=`echo $line | grep "[0-9]" | cut -d " " -f1`
+            tempport=`echo $line | grep "[0-9]" | cut -d " " -f2`
+            PORT_NUM="$tempslot/$tempport"
+        else
+            PORT_NUM=`echo $line | grep "[0-9]" | cut -d " " -f1`
+        fi
+
+        isl_ports=`/fabos/link_bin/portcfgshow $PORT_NUM | grep "ISL R_RDY Mode" | grep "ON" | wc -l | sed 's/ //g'`
+        d_ports=`/fabos/link_bin/portcfgshow $PORT_NUM | grep "D-Port mode" | grep "ON" | wc -l | sed 's/ //g'`
+
+
+        if [ "$isl_ports" == "1" ] && [ "$d_ports" == "1" ]; then
+            return $STS_ERR
+        fi
+
+    done < $D_PORT_CONF
+
+    return $STS_OK
+
+}
+
+#check any r_rdy mode port is configured as d_port
+check_d_port_r_rdy_support()
+{
+    check_vf_enabled
+
+    if [ $? -ne $STS_OK ]; then
+        CHASSISCMD="cmd_chassis"
+        for_all_contexts check_r_rdy_d_port_config
+    else
+        check_r_rdy_d_port_config
+    fi
+
+    if [ $? -eq $STS_OK ]; then
+        rm -rf /tmp/tmp_dport_show*
+        return $STS_OK
+    else
+        rm -rf /tmp/tmp_dport_show*
+        return $STS_ERR
+    fi
+
+}
+check_70_1_sw_features()
+{
+
+	$ECHO check_70_1_sw_features
+
+	TEST check_rte_policy_in_contexts "$UNSUPPORTED_DBR_ON_DOWNGRADE"
+
+	TEST check_d_port_r_rdy_support "$D_PORT_R_RDY_NOT_SUPPORTED"
+	TEST check_d_port_dwdm_support "$D_PORT_DWDM_NOT_SUPPORTED"
+
+	return $RET_CODE
+}
+
+# This routine checks whether any of the 7.0 software
+# features are active
+#
+
+check_70_sw_features()
+{
+	$ECHO check_70_sw_features
+	TEST check_portname_len "$PORTNAME_LEN_DISALLOWED_MSG"
+
+	TEST check_PAD_feature "$PAD_FEATURE_CHECK_MSG"
+
+	TEST check_ag_staticfports "$UNSUPPORTED_STATICFPORTS_CONFIG_ON_DOWNGRADE"
+    
+ 	TEST check_ag_eemon_installed "$UNSUPPORTED_EEMON_ON_DOWNGRADE"
+
+	TEST check_ag_fmon_installed "$UNSUPPORTED_FMON_ON_DOWNGRADE"
+
+	TEST check_enhanced_licenses_installed "$UNSUPPORTED_LICENSES_ON_DOWNGRADE"
+
+	TEST check_udrole_users_presence "$UDROLE_FWDL_DISALLOWED_MSG"
+
+	TEST check_multi_email_set_allinstances  "$UNSUPPORTED_MULTIPLE_EMAIL_FW_ALERT"
+
+	TEST check_veport_threshconfig_allinstances "${UNSUPPORTED_VEPORT_THRESHOLD_CONFIG}"
+
+	TEST check_ldap_ipv6_configuration "$CHECK_LDAP_CONFIGURED_OVER_IPv6"
+
+	TEST check_ipfilter_forward_rule "$UNSUPPORTED_IPFILTER_POLICY"
+
+	TEST check_tstimezone_with_three_sections_allinstances "$UNSUPPORTED_TSTIMEZONE"
+
+	TEST check_for_vpwwns_configuration "$VPWWN_CONFIGURED"
+
+	#TEST check_cfg_speed "$PORTSPEED_DISALLOWED_MSG"
+
+	TEST check_for_ve_xisl_configuration "$VE_XISL_CONFIGURED"
+
+	#
+	#Delete new config key of Marginal,Faulty, Missing SFPs component
+	#of switchstatuspolicy
+	#
+	check_swstatus_cfg_key
+	#
+	# Block downgrade if Ex-Port configured in NOS mode.
+	# Though the NOS IM5 mode feaure is supported only from 7.0.1 (toro), we
+	# are using this function to handle all the downgrade versions.
+	#
+	TEST check_nos_ex_ports "$NOS_EX_PORT_RESTRICTION"
+
+	# Block downgrade if 7.0.1 feature is enabled
+	TEST check_rte_policy_in_contexts "$UNSUPPORTED_DBR_ON_DOWNGRADE"
+
+	return $RET_CODE
+}
+
+# Block downgrade from 7.0.1 to pre-7.0.1 in Dcx+ and Pluto+ when
+# FC8-16 or FC8-32 or FC8-48 is present
+check_FC8_blades_dcx_pluto_plus() {
+
+	ret=$STS_OK
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		check_C3_blades
+		if [ $? -ne $STS_OK ]; then
+			if `/fabos/bin/slotshow | grep "SW BLADE" | grep -E "37|55|51" 1>/dev/null 2>&1`; then
+				ret=$STS_ERR
+			fi
+		fi
+	fi
+
+	return $ret
+}
+
+# This routine checks whether any of the 7.0 hardware
+# is present
+#
+
+check_70_hw_features()
+{
+	$ECHO check_70_hw_features
+
+	TEST check_C3_blades "$CONDOR3_BLADE_IS_PRESENT"
+
+	TEST check_FC8_blades_dcx_pluto_plus "$FC8_BLADE_IS_PRESENT"
+
+	TEST check_max_zone_size_in_contexts "$UNSUPPORTED_ZONE_SIZE"
+
+	return $RET_CODE
+}
+
+check_enhanced_fc8_present()
+{
+	$ECHO check_enhanced_fc8_present
+
+	if [ $TO_MAJOR -eq 7 -a $TO_MINOR -eq 0 -a $TO_PATCH -eq 0 ]; then
+		TEST check_ENHANCED_FC8_blades "$ENHANCED_FC8_BLADE_IS_PRESENT"
+		return $RET_CODE
+	fi
+	
+	return $STS_OK
+}
+
+# check the platforms supported by Edison
+check_platforms_supported_by_edison()
+{
+	ret=0
+	case ${SWBD##SWBD} in
+		'62' | '77' | '83')
+			ret=$STS_OK
+		;;
+		*)
+			ret=$STS_ERR
+		;;
+	esac
+	return $ret
+}
+
+# This routine checks whether any of the 6.4 software
+# features are active
+#
+check_64_sw_features()
+{
+	$ECHO check_64_sw_features
+
+	TEST check_portname_len "$PORTNAME_LEN_DISALLOWED_MSG"
+
+	TEST check_disk_tape_coexist "$UNSUPPORTED_DISK_TAPE_COEXIST"
+
+	TEST check_vex_ports_configured "$VEX_PORT_DISALLOWED_MSG"
+
+	TEST check_ls_ports "$UNSUPPORTED_LS_PORTS_MSG"
+
+	TEST check_csctl_configured "$CSCTL_DISALLOWED_MSG"
+
+	TEST check_switch_8bit_def_sw_mode "$UNSUPP_DYN_AREA_ON_DEF_SW"
+
+	TEST check_etiz_zones_presence "$ETIZ_EXISTANCE_MSG"
+
+	TEST check_sec_auth_certificate_database "$UNSUPPORTTED_SEC_AUTH_CERTIFICATE_DATABASE_VALUE"
+
+	TEST check_striker_4blades	"$STRIKER4BLADESUPPORT_DISALLOWED_MSG"
+
+	TEST check_feature_decommisison "${UNSUPPORTED_ENCRYPTION_VERSIONING_DEC}"
+
+	TEST check_feature_disk_tape_coexistence "${UNSUPPORTED_ENCRYPTION_VERSIONING_DT}"
+
+	TEST check_feature_replication "${UNSUPPORTED_ENCRYPTION_VERSIONING_REPL}"
+
+	TEST check_feature_tklm "${UNSUPPORTED_ENCRYPTION_VERSIONING_TKLM}"
+
+	TEST ag_persistent_pid_enabled "$UNSUPPORTED_PERSISTENT_PID_ON_DOWNGRADE"
+
+	TEST ag_wwnbal_policy_enabled "$UNSUPPORTED_WWNBAL_POLICY_ON_DOWNGRADE"
+
+	TEST ag_wwn_staticmap_enabled "$UNSUPPORTED_AGWWN_STATICMAP_ON_DOWNGRADE"
+
+	TEST check_locked_eport "$LOCKED_EPORT_DISALLOWED_MSG"
+
+	TEST check_lossless_dps_in_contexts "$UNSUPPORTED_LOSSLESS_DPS_ON_DOWNGRADE"
+
+	TEST check_hif_mode_in_im "$UNSUPPORTED_HIF_ON_DOWNGRADE"
+
+	TEST check_buf_op_enabled "$BUF_OP_ENABLED"
+
+	TEST check_serdes_tune_enabled "$SERDES_TUNE_ENABLED"
+
+	TEST fcoe_veports_enabled "$UNSUPPORTED_FCOE_VE_PORTS_ON_DOWNGRADE"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any of the 6.3 software
+# features are  active
+#
+check_63_sw_features()
+{
+	$ECHO check_63_sw_features
+
+	TEST check_ethsw_enabled "$UNSUPPORTED_ETHSW_DISABLE_MSG"
+
+	TEST check_mace_ag_mode_enabled "$UNSUPPORTED_AG_ON_MACE_MSG"
+
+	TEST check_elara_ag_mode_enabled "$UNSUPPORTED_AG_ON_ELARA_MSG"
+
+	TEST check_c2_mirror_connection "$DOWNGRADE_WITH_C2_PORT_MIRROR"
+
+	TEST check_default_did_offset_in_im "$DOMOFFSETINTEROPCONFIGMSG"
+
+	TEST check_ag_qos_port_active "$AG_QOS_PORT_ACTIVE_MSG"
+
+	TEST check_qos_di_zones_presence "$QOS_DI_ZONE_EXISTANCE_MSG"
+
+	TEST check_ag_qos_port_active_fabric_side "$AG_QOS_PORT_ACTIVE_FABRIC_SIDE_MSG"
+
+	TEST check_area_range	"$AREA_ASSIGNED_BEYND_MAXPHPORTS"
+
+	TEST ag_persistent_alpa_enabled "$UNSUPPORTED_PERSISTENT_ALPA_ON_DOWNGRADE"
+
+	TEST check_sflow_enabled "$UNSUPPORTED_SFLOW_ON_DOWNGRADE"
+
+	TEST check_dot1x_enabled "$UNSUPPORTED_DOT1X_ON_DOWNGRADE"
+
+	TEST check_syscard_enabled "$UNSUPPORTED_SYSTEMCARD_FEATURE_ON_DOWNGRADE"
+
+	TEST check_qourumcard_size "$UNSUPPORTED_QOURUMCARD_SIZE_NON_ZERO"
+
+	TEST check_passwdCfg_history "$UNSUPPORTED_PASSWDCFG_HISTORY_VALUE"
+
+	# Check for secondary SKM KV configuration
+	TEST check_sec_skm_kv "$UNSUPPORTED_TWO_SKM_KVS_DOWNGRADE"
+
+	# Check for portfencing bit for State Change
+	TEST check_pf_statechange_set_allinstances "$UNSUPPORTED_PORTFENCING_STATECHANGEMSG"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any of the 6.2 software
+# features are  active
+#
+check_62_sw_features()
+{
+	$ECHO check_62_sw_features
+
+	TEST check_vf_enabled "$UNSUPPORTED_VF_DISABLE_MSG"
+
+	# If AG mode enabled on Spirit, don't allow downgrade to lower that 6.2
+	TEST check_ag_mode_enabled "$UNSUPPORTED_AG_ON_SPIRIT_MSG"
+
+	TEST check_for_rd_zones_with_mode_3_configured "$RDINTEROP3CONFIGUREDMSG"
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether there are any features or conditions
+# to be handled when upgrading
+#
+check_pre70_sw_features()
+{
+	$ECHO check_pre70_sw_features
+
+
+	# Check zone names for compatibility with MSFR
+	TEST check_for_msfr_zone_names "$MSFRZONEORCFGNAMEFOUNDMSG"
+
+	# Check for secondary RKM KV configuration
+	TEST check_sec_rkm_kv "$UNSUPPORTED_TWO_RKM_KVS_UPGRADE"
+
+	TEST check_http_enabled "$WEBLINKER_MSG"
+
+	TEST check_interop_in_contexts "$UNSUPPORTED_INTEROP_MODE"
+    
+	if [ $CUR_MAJOR -lt 7 ]; then
+		if [ $TO_MAJOR -eq 7 ]; then
+			TEST check_multi_fwconfigure_change "$UNSUPPORTED_FWCONFIGURE2"
+		fi
+	fi
+	TEST check_rrdy_mode_in_contexts "$UNSUPPORTED_RRDY_BASE_SWITCH"
+
+   TEST fcfw_configured "$FCFW_NOT_SUPPORTED"
+
+   TEST bstr_configured "$BSTR_NOT_SUPPORTED"
+
+
+	#
+	# Block if any FW element timebase is configured to seconds
+	#
+
+	TEST check_fw_seconds_timebase_allinstances "$UNSUPPORTED_CHECK_SECOND_TIMEBASE2"
+
+	TEST check_ioddelay_set_in_contexts "$UNSUPPORTED_IODDELAY_ON_UPGRADE"
+
+	#
+	# Block downgrade if Ex-Port configured in NOS mode.
+	# Though the NOS IM5 mode feaure is supported only from 7.0.1 (toro), we
+	# are using this function to handle all the downgrade versions.
+	#
+	TEST check_nos_ex_ports "$NOS_EX_PORT_RESTRICTION"
+
+	#
+	# Warn user of imminent change with default behavior of duplicate portwwn
+	#
+	if [ $CUR_MAJOR -lt 7 ]; then
+		if [ $TO_MAJOR -ge 7 ]; then
+			TEST check_dupe_wwpn_in_contexts "$UNSUPPORTED_DUP_PORT_WWN"
+		fi
+	fi
+
+	return $RET_CODE
+}
+
+#
+# This routine checks whether any pre v.7 hardware is present
+#
+check_pre70_hw_features()
+{
+	$ECHO check_pre70_hw_features
+
+	TEST scimitar_present "$SCIMITARMSG"
+
+	return $RET_CODE 
+}
+
+#check the top talker config key and remove it
+check_tt_config_key()
+{
+    /fabos/cliexec/configshow -all | grep -q "perf.ToptalkerEnabledonC2"
+
+    if [ $? -eq 0 ]; then
+    /fabos/cliexec/config remove "perf.ToptalkerEnabledonC2"
+    /fabos/cliexec/configcommit
+    fi
+	return $STS_OK
+}
+
+#
+# Display duplicate WWPN warning message
+# when upgrading to 7.0
+#
+display_dupe_wwpn_warning_msg()
+{
+	NSSHOW=/tmp/ns_show.txt
+	/fabos/link_bin/nsshow > $NSSHOW
+	/fabos/link_bin/nscamshow >> $NSSHOW
+	SORTED_FILE=/tmp/ns_sort.txt
+	UNIQUE_FILE=/tmp/ns_uniq.txt
+	PID_FILE=/tmp/ns_pid_wwn.txt
+	DUP_WWN=/tmp/ns_dup_wwn.txt
+
+	grep "[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F];" $NSSHOW | gawk -F';' '{ print $3 }' | sort > $SORTED_FILE
+	uniq $SORTED_FILE > $UNIQUE_FILE
+	if [ `cat $SORTED_FILE|wc -l` -ne `cat $UNIQUE_FILE|wc -l` ]; then
+		echo "Duplicate PortWWN Present in the Fabric"
+		grep "[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F];" $NSSHOW | gawk -F';' '{ print $3 "    "$1}' | gawk '{ print $1, $3 }' > $PID_FILE
+		uniq -d $SORTED_FILE > $DUP_WWN
+		BAKIFS=$IFS
+		IFS=$(echo -en "\n\b")
+			exec 3<&0
+			exec 0<"$DUP_WWN"
+			while read -r line
+			do
+				grep $line $PID_FILE
+			done
+			exec 0<&3
+		IFS=$BAKIFS
+
+		return $STS_ERR
+	fi 
+        
+	return $STS_OK
+}
+
+#check if duplicate PWWN exists in all contexts
+check_dupe_wwpn_in_contexts() {
+	check_vf_enabled
+
+	if [ $? -ne $STS_OK ]; then
+		CHASSISCMD="cmd_chassis"
+		for_all_contexts display_dupe_wwpn_warning_msg
+	else
+		display_dupe_wwpn_warning_msg
+	fi
+
+	if [ $? -eq $STS_OK ]; then
+		rm -f /tmp/ns*
+		return $STS_OK
+	else
+		rm -f /tmp/ns*
+		return $STS_ERR
+	fi
+
+}
+#
+# This is upgrade to 7.0 case
+#
+handle_to_70()
+{
+	$ECHO handle_to_70
+
+	#
+	# We don't allow 6.1 and previous to upgrade to this version
+	#
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 1 -o $CUR_MAJOR -lt 6 ]; then
+		add_err_status "$UNSUPPORTED_UP_VERMSG"
+		return $STS_ERR
+	fi
+
+	#
+	# Block for 7.0.1 -> 7.0.0 for Tom-2
+	#
+	if [ ${SWBD##SWBD} == '118' ]; then
+		if [ $CUR_MAJOR -eq 7 -a $CUR_MINOR -eq 0 -a $CUR_PATCH -gt 0 ]; then
+			if [ $TO_MAJOR -eq 7 -a $TO_MINOR -eq 0 -a $TO_PATCH -eq 0 ]; then
+				add_err_status "$UNSUPPORTEDPLATFORMMSG"
+				return $STS_ERR
+			fi
+		fi
+	fi
+
+	# Block downgrade from 7.0.1 to 7.0.0 in Dcx+ and Pluto+ when
+	# FC8-16 or FC8-32 or FC8-48 is present.
+	if [ $TO_MAJOR -eq 7 -a $TO_MINOR -eq 0 -a $TO_PATCH -eq 0 ]; then
+		TEST check_FC8_blades_dcx_pluto_plus "$FC8_BLADE_IS_PRESENT"
+		if [ $? -ne $STS_OK ]; then
+			return $STS_ERR
+		fi
+	fi
+
+	#
+	# Allow upgrade from 6.2 only when disruptive single mode is used.
+	#
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 2 ]; then
+		allow_nondisruptive_fwdl
+		if [ $? -ne $STS_OK ]; then
+			add_err_status "$UNSUPPORTED_UP_VERMSG"
+			return $STS_ERR
+		fi
+	fi
+
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 3 ]; then
+		if [ $TO_MAJOR -eq 7 -a $TO_MINOR -ge 0 ]; then
+			#
+			# Allow disruptive fwdl from 6.3 to 7.0
+			#
+			allow_disruptive_single_mode_fwdl
+			if [ $? -ne $STS_OK ]; then
+				add_err_status "$UNSUPPORTED_NON_DISRUPTIVE_MODE_FWDL"
+				return $STS_ERR
+			fi
+			#
+			# fwdl with auto reboot option is not supported
+			# for upgrade from 6.3 to 7.0. 
+			#
+			if [ -z $TYPE ]; then
+				check_autoreboot_opt
+				if [ $? -ne $STS_OK ]; then
+					add_err_status "$UNSUPPORTED_SINGLE_MODE_AUTOREBOOT_OPT"
+					return $STS_ERR
+				else
+					echo -e $UNSUPPORTED_AUTOREBOOT_OPT_WARN_MSG	
+				fi
+			fi
+		fi
+	fi
+	
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -ge 3 ]; then
+		if [ $TO_MAJOR -eq 7 -a $TO_MINOR -ge 0 ]; then
+			#
+			#Delete the tt enbled in c2  key if it is present in 6.4
+			#
+			check_tt_config_key
+		fi
+	fi
+
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 3 ]; then
+		if [ $TO_MAJOR -eq 7 -a $TO_MINOR -ge 0 ]; then
+			TEST check_flt_mon_config_6_3 "$UNSUPPORTED_FLT_MON_CONFIG_6_3"
+			OVERALL_STS=$?
+			if [ $OVERALL_STS != $STS_OK ]; then
+				return  $OVERALL_STS
+			fi
+		fi
+	fi
+
+    if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 4 ]; then
+        if [ $TO_MAJOR -eq 7 -a $TO_MINOR -ge 0 ]; then
+            TEST check_flt_mon_config_allinstances "$UNSUPPORTED_FLT_MON_CONFIGURED"
+            OVERALL_STS=$?
+            if [ $OVERALL_STS != $STS_OK ]; then
+	            return	$OVERALL_STS
+            fi
+		fi
+    fi
+
+	#
+	# Block HCL from 6.4.1_fcoe to v7.0 on DCX/DCX-4S, if Europa blades are powered on.
+	#
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		/sbin/getfabosver | grep -qi -e "6.4.1_fcoe"
+		if [ $? -eq 0 ]; then
+			# check if it is 6.4.1_fcoe1.
+			/sbin/getfabosver | grep -qi -e "6.4.1_fcoe1"
+			if [ $? -ne 0 ]; then
+				# check if it is non disruptive fwdl
+				check_for_non_disruptive_fwdl
+				if [ $? -eq 0 ]; then
+					# Check if Europa blades are present.
+					europa_present
+					if [ $? -gt 0 ]; then
+						# Now check if any of the Europa blade is powered on.
+						check_if_Europa_blade_is_power_on
+						if [ $? -ne $STS_OK ]; then
+							add_err_status "$UNSUPPORTED_EUROPA_POWER_ON_MSG"
+							return $STS_ERR
+						else
+							#
+							# Europa blades are already powered off. So print a note to power ON
+							# the Europa blades after the switch is rebooted with the new firmware.
+							#
+							echo -e $EUROPA_BLADE_POWER_ON_NOTE
+						fi		
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	#
+	# Block if any FCIP feature checks fail
+	#
+	TEST check_xfcip_features "$XFCIP_FEATURE_RESTRICTION"
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block if any condor ex-port present
+	#
+	TEST check_condor_ex_ports_configured "$CONDOR_EX_PORT_RESTRICTION"
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+	#
+	# Check for the co-existence of Marathon and Striker blades
+	#
+	TEST check_blades_marathon_striker_enabled "$MARATHON_STRIKER_ERR_MSG"
+	if [ $? -ne $STS_OK ]; then
+		return $STS_ERR
+	fi
+
+	#
+	# Check for any blocking features or conditions.
+	#
+	check_pre70_sw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block downgrade if any Enhanced FC8 blade is present.
+	#
+	check_enhanced_fc8_present
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+		
+	#
+	# Block downgrade if any pre 7.0 specific hw feature is enabled.
+	#
+	check_pre70_hw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	check_sec_auth_certificate_database_for_brcd
+	if [ $? -ne $STS_OK ]; then
+		add_err_status "$UNSUPPORTED_BRCD_CERTIFICATE_DATABASE_VALUE"
+        return $STS_ERR
+    fi
+	#
+	# print fcoe provision warning message if upgrading from 6.4.x to 7.0
+	#
+	if [ $CUR_MAJOR -eq 6 ]; then
+		# Check for Edison
+		/sbin/getfabosver | grep -qi -e "6.4.1_fcoe"
+		if [ $? -ne 0 ]; then
+			fcoe_provision_warn_msg
+		fi
+	fi
+
+	#
+	# Block 7.0.1 -> 7.0.0 if 7.0.1 feature is enabled 
+	#
+	if [ $TO_MAJOR -eq 7 -a $TO_MINOR -eq 0 -a $TO_PATCH -eq 0 ]; then
+		check_70_1_sw_features
+		OVERALL_STS=$?
+		if [ $OVERALL_STS != $STS_OK ]; then
+			return $OVERALL_STS
+		fi
+	fi	
+
+	return $STS_OK
+}
+
+asic_db_blade_type_() {
+
+   # initialize to unknown blade id & type
+	blade_type=""
+	num_c2s=0
+	if test -f /proc/fabos/blade/$1/info; then
+
+		# ref. blade id is defined in linux/include/brocade/swbd.h		
+		bladeid=`cat /proc/fabos/blade/$1/info | /bin/grep --binary-files=text bladeId | sed 's/[^0-9]//g'`
+
+      case "$bladeid" in
+		"58" ) blade_type="littlebear";num_c2s=1;;
+		"60" ) blade_type="bulova";num_c2s=1;;
+		"61" ) blade_type="blazer3";num_c2s=1;;
+		"63" ) blade_type="superhawk2";num_c2s=1;;
+		"64" ) blade_type="utah";num_c2s=1;;
+		"70" ) blade_type="falcon2";num_c2s=1;;
+		"73" ) blade_type="kestrel2";num_c2s=1;;
+		"37" ) blade_type="despina";num_c2s=1;;
+		"55" ) blade_type="larissa";num_c2s=2;;
+		"51" ) blade_type="triton";num_c2s=2;;
+		"46" ) blade_type="hydra";num_c2s=2;;
+		"56" ) blade_type="spirit";num_c2s=1;;
+		"79" ) blade_type="gladius";num_c2s=1;;
+		"59" ) blade_type="tomahawk";num_c2s=1;;
+		"53" ) blade_type="thor";num_c2s=9;;
+		"52" ) blade_type="proteus";num_c2s=4;;
+		"77" ) blade_type="quattro";num_c2s=4;;
+		"45" ) blade_type="elara";num_c2s=1;;
+		"74" ) blade_type="europa";num_c2s=1;;
+		"69" ) blade_type="spike";num_c2s=1;num_blaster=1;;
+		"75" ) blade_type="striker";num_c2s=1;num_blaster=2;;
+		"42" ) blade_type="mace";num_c2s=2;;
+		"43" ) blade_type="lance";num_c2s=2;;
+		* ) blade_type="others";num_c2s=0;
+      esac
+
+	fi
+}
+
+#
+# This is upgrade to 6.4 case
+#
+handle_to_64()
+{
+	$ECHO handle_to_64
+
+	#
+	# Block downgrade if any 6.4.1 specific feature is enabled
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -eq 0 ]; then
+		TEST check_buf_op_enabled "$BUF_OP_ENABLED"
+		if [ $? -ne $STS_OK ]; then
+			return $STS_ERR
+		fi
+	fi
+
+	#
+	# Block downgrade if any 6.4.2 specific feature is enabled
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -lt 2 ]; then
+		TEST check_serdes_tune_enabled "$SERDES_TUNE_ENABLED"
+		if [ $? -ne $STS_OK ]; then
+			return $STS_ERR
+		fi
+	fi
+
+	#
+	# Block downgrade if any 6.4.3 specific feature is enabled
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -lt 3 ]; then
+		TEST check_portname_len "$PORTNAME_LEN_DISALLOWED_MSG"
+		if [ $? -ne $STS_OK ]; then
+			return $STS_ERR
+		fi
+	fi
+
+
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -eq 0 ]; then
+		TEST check_feature_tklm "${UNSUPPORTED_ENCRYPTION_VERSIONING_TKLM}"
+		if [ $? -ne $STS_OK ]; then
+		    return $STS_ERR
+		fi
+	fi
+
+	#
+	# We don't allow 6.1 and previous to upgrade to this version
+	#
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 1 -o $CUR_MAJOR -lt 6 ]; then
+		add_err_status "$UNSUPPORTED_UP_VERMSG"
+		return $STS_ERR
+	fi
+
+	#
+	# Allow upgrade from 6.2 only when disruptive single mode is used.
+	#
+	if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -eq 2 ]; then
+		allow_nondisruptive_fwdl
+		if [ $? -ne $STS_OK ]; then
+			add_err_status "$UNSUPPORTED_UP_VERMSG"
+			return $STS_ERR
+		fi
+	fi
+
+	#Condition to check for co-existence of Marathon and Striker blade
+	#when migrating to edison
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -eq 1 ]; then
+		if [ -z $TYPE ]; then
+			/bin/cat $RELEASE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+		else
+			/bin/cat $RESTORE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+		fi
+
+		if [ $? -eq 0 ]; then
+			#Check for the co-existence of blades in edison
+			TEST check_blades_marathon_striker_enabled "$MARATHON_STRIKER_ERR_MSG"
+			if [ $? -ne $STS_OK ]; then
+				return $STS_ERR
+			fi
+		fi
+	fi
+	# Check for the number of Europa blades supported while downgrading to 6.4.x.
+	if [ -z $TYPE ]; then
+		/bin/cat $RELEASE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+	else
+		/bin/cat $RESTORE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+	fi
+	
+	if [ $? -ne 0 ]; then
+		TEST check_europa_blade_count_support "$UNSUPPORTED_EUROPA_BLADE_COUNT"
+		if [ $RET_CODE == $STS_ERR ]; then
+			return $STS_ERR
+		fi
+	fi
+
+	#
+	# Check for any blocking features or conditions.
+	#
+	check_pre70_sw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+	#
+	# Block downgrade to Edison if platform is not supported.
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 4 -a $TO_PATCH -eq 1 ]; then
+		/bin/cat /tmp/release.plist  2> /dev/null | grep -i "6.4.1_fcoe"  > ${NULL} 2>&1
+		if [ $? -eq 0 ]; then
+			TEST check_platforms_supported_by_edison "$UNSUPPORTEDPLATFORMMSG"
+			RET=$?
+			if [ $RET != $STS_OK ]; then
+				return $RET
+			fi
+		fi
+	fi
+	
+	#
+	# Block HCL from  v7.0 to 6.4.1_fcoe on DCX/DCX-4S, if Europa blades are powered on.
+	#
+	if [ ${SWBD##SWBD} == '62' ] || [ ${SWBD##SWBD} == '77' ]; then
+		if [ -z $TYPE ]; then
+			/bin/cat $RELEASE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+			if [ $? -eq 0 ]; then
+				# check if it is 6.4.1_fcoe1.
+				/bin/cat $RELEASE_FILE  2> /dev/null | grep -i -e "6.4.1_fcoe1"
+				if [ $? -ne 0 ]; then
+					# check if it is non disruptive fwdl
+					check_for_non_disruptive_fwdl
+					if [ $? -eq 0 ]; then
+						# Check if Europa blades are present.
+						europa_present
+						if [ $? -gt 0 ]; then
+							# Now check if any of the Europa blade is powered on.
+							check_if_Europa_blade_is_power_on
+							if [ $? -ne $STS_OK ]; then
+								add_err_status "$UNSUPPORTED_EUROPA_POWER_ON_MSG"
+								return $STS_ERR
+							else
+								#
+								# Europa blades are already powered off. So print a note to power ON
+								# the Europa blades after the switch is rebooted with the new firmware.
+								#
+								echo -e $EUROPA_BLADE_POWER_ON_NOTE
+							fi	
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	#
+	# Block downgrade if any FCIP feature checks fail
+	#
+	TEST check_xfcip_features "$XFCIP_FEATURE_RESTRICTION"
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block downgrade if any 7.0 specific sw feature is enabled.
+	#
+	check_70_sw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block downgrade if any 7.0 specific hardware is present.
+	#
+	check_70_hw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+	
+	# get the to be downloaded version
+	if [ -z $TYPE ]; then
+		/bin/cat $RELEASE_FILE 2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+	else
+		/bin/cat $RESTORE_FILE 2> /dev/null | grep -i -e "6.4.1_fcoe" > ${NULL} 2>&1
+	fi
+	
+	if [ $? -ne 0 ]; then
+		fcoe_provision_warn_msg
+	fi
+
+	# Need to Turn off the discard for C2 Pizza box before downgrade and C2 blade in DCX and Pluto
+		cd /proc/fabos/blade
+		for i in `ls -d [0-9]* | sort -n` ; do
+			asic_db_blade_type_ $i
+			if [ "$?" -eq 0 ]; then
+		count=0
+		while [ $count -lt $num_c2s ]
+		do
+					/fabos/link_sbin/db $i/$count txrx disable pr_disc
+			(( count += 1 ))
+		done
+	fi
+		done
+	
+	return $STS_OK
+}
+
+handle_to_63()
+{
+	$ECHO handle_to_63
+
+	#
+	# Block downgrade if any 7.0 specific hardware is present.
+	#
+	check_70_hw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Allow disruptive fwdl from 7.0 to 6.3
+	#
+	if [ $CUR_MAJOR -eq 7 -a $CUR_MINOR -eq 0 ]; then
+		allow_disruptive_single_mode_fwdl
+		if [ $? -ne $STS_OK ]; then
+			add_err_status "$UNSUPPORTED_NON_DISRUPTIVE_MODE_FWDL"
+			return $STS_ERR
+		fi
+	fi
+	#
+	# Block downgrade if any 6.3.1 specific feature is enabled
+	#
+	if [ $TO_MAJOR -eq 6 -a $TO_MINOR -eq 3 -a $TO_PATCH -eq 0 ]; then
+		TEST check_elara_ag_mode_enabled "$UNSUPPORTED_AG_ON_ELARA_MSG"
+		if [ $? -ne $STS_OK ]; then
+			return $STS_ERR
+		fi
+
+	fi
+
+	#
+	# Block downgrade if any FCIP feature checks fail
+	#
+	TEST check_xfcip_features "$XFCIP_FEATURE_RESTRICTION"
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block downgrade if any 6.4 specific sw feature is enabled.
+	#
+	check_64_sw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	# Block downgrade if any 6.4 specific hw feature is enabled.
+	#
+	check_64_hw_features
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+	
+	#
+	# Block downgrade if Europa Blade Count is more than 2.
+	#
+	TEST check_europa_blade_count_support "$UNSUPPORTED_EUROPA_BLADE_COUNT"
+	RET=$?
+	if [ $RET != $STS_OK ]; then
+		return $RET
+	fi
+	
+	#
+	# print fcoe provision warning message if downgrading from 6.4.1_fcoe. 
+	#
+	fcoe_provision_warn_msg
+
+	#
+        # Block downgrade if any 7.0 specific sw feature is enabled.
+        #
+        check_70_sw_features
+        OVERALL_STS=$?
+        if [ $OVERALL_STS != $STS_OK ]; then
+                return $OVERALL_STS
+        fi
+
+	return $STS_OK
+}
+
+# This is to block firmwaredownload from Matador
+# to 6.2 or previous versions of 6.2
+handle_to_62_lower()
+{
+	$ECHO handle_to_62_lower
+	# Block downgrade if any FCIP feature checks fail
+	#
+	TEST check_xfcip_features "$XFCIP_FEATURE_RESTRICTION"
+	OVERALL_STS=$?
+	if [ $OVERALL_STS != $STS_OK ]; then
+		return $OVERALL_STS
+	fi
+
+	#
+	add_err_status "$UNSUPPORTED_DL_VERMSG"
+	return ${STS_ERR}
+}
+
+#check if passwdcfg_history value is 0.
+check_passwdCfg_history()
+{
+	HIST_VAL=$(/fabos/abin/passwdcfg --show | sed -n -e 's/passwdcfg.history: //gp')
+	if [ $HIST_VAL -eq 0 ]; then
+               return $STS_ERR
+	fi
+
+	return $STS_OK
+}
+
+# get the current firmware version
+get_current_version()
+{
+	CUR_MAJOR=$(/sbin/getfabosver | sed -n -e 's/Major://gp')
+	CUR_MINOR=$(/sbin/getfabosver | sed -n -e 's/Minor://gp')
+	CUR_PATCH=$(/sbin/getfabosver | sed -n -e 's/Patch://gp')
+}
+
+# Function to check whether marathon and striker blades are present.
+# If both the blades are present, then the firmwaredownload needs
+# to be blocked
+check_blades_marathon_striker_enabled()
+{
+	STRIKER_PRESENT=0
+	MARATHON_PRESENT=0
+	blade_count=0
+
+	slotshow_out=`/fabos/cliexec/slotshow -d576 | /bin/grep "AP BLADE" | /bin/sed 's/[ \t][ \t]*/;/g'`
+	blade_count=`echo $slotshow_out | /bin/grep "BLADE" | /usr/bin/wc -w`
+
+	if [ $blade_count -le 1 ]; then
+		return $STS_OK
+	fi
+
+	count=1
+
+	while [ $count -le $blade_count ]
+	do
+		temp_str=`echo $slotshow_out | /usr/bin/cut -d ' ' -f $count`
+		blade_id=`echo $temp_str | /usr/bin/cut -d ';' -f 5`
+
+		if [ $blade_id -eq 75 ]; then
+			STRIKER_PRESENT=1
+		elif [ $blade_id -eq 24 ]; then
+			MARATHON_PRESENT=1
+		fi
+
+		count=`/usr/bin/expr $count + 1`
+	done
+
+	if [ $STRIKER_PRESENT -eq 1 -a $MARATHON_PRESENT -eq 1 ]; then
+		ret=$STS_ERR
+	else
+		ret=$STS_OK
+	fi
+
+	if [ $ret -eq $STS_OK ]; then
+		if [ $MARATHON_PRESENT -eq 1 -a $STRIKER_PRESENT -eq 0 ]; then
+			DISPLAY_MARATHON_STRIKER_WARN_MSG=1	
+		fi
+	fi
+
+	return $ret
+}
+
+#
+# main()
+#
+$ECHO Requested version is ${TO_MAJOR}.${TO_MINOR}.${TO_PATCH} Type is $TYPE
+
+
+if [ -z $TYPE ]; then
+	TEST check_hcl_switchstate "$SWITCH_FAULTY_MSG"
+	RET=$?
+	if [ $RET != $STS_OK ]; then
+		exit $RET_CODE
+	fi
+
+	#
+	# clean up to free up disk space on /mnt before firmwaredownload
+	#
+	$ECHO removing tracedump.dmp
+	rm -f /mnt/var/tracedump.dmp
+	# Overwrite raslog.int and raslog.ext file with FWDL version
+	# This ensures that we do not overwrite the raslog files of new standby with
+	# new active CP files.
+	RASLOG_INT_FILE=/mnt/etc/raslog.int
+	RASLOG_EXT_FILE=/mnt/etc/raslog.ext
+
+	echo "RASLOG" > $RASLOG_INT_FILE
+	echo "RASLOG" > $RASLOG_EXT_FILE
+fi
+
+get_current_version
+
+#
+# Handle a specific firmware version
+#
+case "${TO_MAJOR}.${TO_MINOR}" in
+	'7.0')
+		handle_to_70
+		RET=$?
+	;;
+	'6.4')
+		handle_to_64
+		RET=$?
+	;;
+	'6.3')
+		handle_to_63
+		RET=$?
+	;;
+		*)
+		handle_to_62_lower
+		RET=$?
+	;;
+esac
+
+#
+# Preinstall check fails
+#
+if [ $RET != $STS_OK ]; then
+	exit $RET;
+fi
+
+# Pre-installation has completed successfully. Need to print the
+# Marathon-striker warning message before firmwaredownload starts
+if [ -z $TYPE ]; then
+	if [ $DISPLAY_MARATHON_STRIKER_WARN_MSG -eq 1 ]; then
+		echo -e "\n$MARATHON_STRIKER_WARN_MSG\n"
+	fi
+fi
+
+#
+# Firmwaredownload check passes, return
+#
+if [ -z $TYPE ]; then
+	$ECHO return code is $RET
+	exit $RET
+fi
+
+#
+# For firmwarerestore, we will perform the firmwarerestore here.
+# it will not return to the caller. That is to workaround a
+# 2.4.19 kernel and 2.3.6 glibc mismatch issue. (79299). Read
+# more comments in fwdl_undo() in the fwdl.c file.
+#
+baddev=`bootenv BadRootDev 2>/dev/null`
+upgrade=`bootenv Upgrade 2>/dev/null`
+softupgrade=`bootenv SoftUpgrade 2>/dev/null`
+
+dev_p=`bootenv OSRootPartition 2>/dev/null | cut -d ';' -f 1`
+dev_s=`bootenv OSRootPartition 2>/dev/null | cut -d ';' -f 2`
+kern_p=`bootenv OSLoader 2>/dev/null | cut -d ';' -f 1`
+kern_s=`bootenv OSLoader 2>/dev/null | cut -d ';' -f 2`
+
+mount_p=`cat /proc/mounts | grep " / " | grep -v rootfs |sed 's? .*??g;s?^.*dev/??g'`
+mount_s=`cat /proc/mounts |grep "/mnt" | sed 's? .*??g;s?^.*dev/??g'`
+
+if [ -n "$baddev" ]; then
+	add_err_status "$FWDL_RUNNING_MSG"
+    	exit 1;
+fi
+
+if [ -n "$softupgrade" ]; then
+	add_err_status "$FWDL_RUNNING_MSG"
+	exit 1;
+fi
+
+if [ "$upgrade" != /dev/$mount_p ]; then
+	add_err_status "$FWRESTORE_DISALLOWED_MSG"
+    	exit 1;
+fi
+
+#
+# prevent firmwarerestore from 6.3 to 6.1.2_cee because
+# the we can not restore the PROM image in this case
+#
+case ${SWBD##SWBD} in
+	'76')
+		if [ ! -s /mnt/boot/bootrom.bin ]; then
+			add_err_status "$FWRESTORE_VER_DISALLOWED_MSG"
+			exit 1;
+		fi
+	esac
+
+# The following steps upgrades accounts with default AD member list
+if [ $CUR_MAJOR -le 6 -a $CUR_MINOR -le 1 ]; then
+	/usr/sbin/chroot /mnt /fabos/libexec/userdb_convert $CUR_MAJOR.$CUR_MINOR $TO_MAJOR.$TO_MINOR > /dev/null 2>&1
+fi
+
+if [ $CUR_MAJOR -eq 6 ] && [ $CUR_MINOR -ge 2 ]; then
+	if [ $TO_MAJOR -le 6 -a $TO_MINOR -le 1 ]; then
+		/fabos/libexec/userdb_convert $CUR_MAJOR.$CUR_MINOR $TO_MAJOR.$TO_MINOR > /dev/null 2>&1
+	fi
+fi
+
+# The following steps restores the old RBAC dynamic db
+if [ $CUR_MAJOR -eq 7 -a $TO_MAJOR -eq 7 ]; then
+	/usr/sbin/chroot /mnt /fabos/libexec/userdb_convert $CUR_MAJOR.$CUR_MINOR $TO_MAJOR.$TO_MINOR > /dev/null 2>&1
+	cp /mnt/etc/fabos/rbac/dynamic /etc/fabos/rbac/dynamic
+fi
+
+#Push Manufacturing key to SP
+if [ -f '/fabos/libexec/spmPublicKeyUpdate' ] ; then
+	/fabos/libexec/spmPublicKeyUpdate
+fi
+
+# Resotoring only the 8548 and 440epx prom images
+echo "Restoring the PROM image ..."
+if [ -s /mnt/boot/bootrom.bin ]; then
+    /usr/sbin/chroot /mnt /sbin/prominst
+fi
+
+bootenv OSRootPartition "$dev_s;$dev_p"
+bootenv OSLoader "$kern_s;$kern_p"
+bootenv Upgrade "/dev/$dev_s"
+bootenv SoftUpgrade "commit"
+
+# Pre-installation has completed successfully. Need to print the
+# Marathon-striker warning message before firmwarerestore reboots
+# the switch
+if [ $DISPLAY_MARATHON_STRIKER_WARN_MSG -eq 1 ]; then
+	echo -e "\n$MARATHON_STRIKER_WARN_MSG\n"
+fi
+
+if [ $CUR_MAJOR -eq 6 -a $CUR_MINOR -le 2 ]; then
+echo "The system is rebooting now!! After reboot, firmwarecommit" \
+    "will be started and the partitions will be restored to the" \
+    "original firmware."
+/fabos/cliexec/reboot -s -r FirmwareDownload -f
+fi
+
+exit 0

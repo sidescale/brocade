@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+#    Copyright (c) 2004 Brocade Communications Systems, Inc.
+#    All rights reserved.
+#
+#    Description:
+#
+#        This pre-install script will be run before firmware
+#        download starts.  It checks the combination of platform
+#        (21=meteor/cp128, 42=saturn/cp256) and chassis option
+#        (1=single switch/CER, 2=dual switch, etc), to see if 
+#        the firmware download will be accepted.
+#
+#        This version of the script is for starting firmware version 4.5.
+#        It needs to be updated for every minor release.
+#
+
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+
+#
+# main()
+#
+
+#
+# Initialize the install bitmap status 
+#
+rm -f /mnt/var/pkg_bitmap
+
+exit 0

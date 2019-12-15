@@ -1,0 +1,12 @@
+<BrocadeFirmware>
+<FirmwareType>FOS</FirmwareType>
+<Version>
+<major>6</major>
+<minor>4</minor>
+<patch>3</patch>
+<build>h</build>
+<displayName>Fabric OS 6.4.3h</displayName>
+</Version>
+<CreationDate>2015-09-30_13:41:57-0700</CreationDate>
+<Platform numPackages="29">86</Platform>
+</BrocadeFirmware>
